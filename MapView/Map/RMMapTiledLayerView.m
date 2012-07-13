@@ -10,17 +10,16 @@
 
 #import "RMMapView.h"
 #import "RMTileSource.h"
-
-@interface RMMapOverlayView ()
-
-- (void)handleDoubleTap:(UIGestureRecognizer *)recognizer;
-
-@end
+#import "RMTileImage.h"
 
 @implementation RMMapTiledLayerView
+{
+    RMMapView *_mapView;
+    id <RMTileSource> _tileSource;
+}
 
-@synthesize delegate;
-@synthesize useSnapshotRenderer;
+@synthesize useSnapshotRenderer = _useSnapshotRenderer;
+@synthesize tileSource = _tileSource;
 
 + (Class)layerClass
 {
@@ -32,46 +31,33 @@
     return (CATiledLayer *)self.layer;
 }
 
-- (id)initWithFrame:(CGRect)frame mapView:(RMMapView *)aMapView
+- (id)initWithFrame:(CGRect)frame mapView:(RMMapView *)aMapView forTileSource:(id <RMTileSource>)aTileSource
 {
     if (!(self = [super initWithFrame:frame]))
         return nil;
 
-    mapView = [aMapView retain];
-
-    self.userInteractionEnabled = YES;
-    self.multipleTouchEnabled = YES;
     self.opaque = NO;
+
+    _mapView = [aMapView retain];
+    _tileSource = [aTileSource retain];
 
     self.useSnapshotRenderer = NO;
 
     CATiledLayer *tiledLayer = [self tiledLayer];
-    tiledLayer.levelsOfDetail = [[mapView tileSource] maxZoom];
-    tiledLayer.levelsOfDetailBias = [[mapView tileSource] maxZoom];
-
-    UITapGestureRecognizer *doubleTapRecognizer = [[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleDoubleTap:)] autorelease];
-    doubleTapRecognizer.numberOfTapsRequired = 2;
-
-    UITapGestureRecognizer *singleTapRecognizer = [[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleSingleTap:)] autorelease];
-    [singleTapRecognizer requireGestureRecognizerToFail:doubleTapRecognizer];
-
-    UITapGestureRecognizer *twoFingerSingleTapRecognizer = [[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTwoFingerSingleTap:)] autorelease];
-    twoFingerSingleTapRecognizer.numberOfTouchesRequired = 2;
-
-    UILongPressGestureRecognizer *longPressRecognizer = [[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPress:)] autorelease];
-
-    [self addGestureRecognizer:singleTapRecognizer];
-    [self addGestureRecognizer:doubleTapRecognizer];
-    [self addGestureRecognizer:twoFingerSingleTapRecognizer];
-    [self addGestureRecognizer:longPressRecognizer];
+    size_t levelsOf2xMagnification = _mapView.tileSourcesContainer.maxZoom;
+    if (_mapView.adjustTilesForRetinaDisplay) levelsOf2xMagnification += 1;
+    tiledLayer.levelsOfDetail = levelsOf2xMagnification;
+    tiledLayer.levelsOfDetailBias = levelsOf2xMagnification;
 
     return self;
 }
 
 - (void)dealloc
 {
-    [[mapView tileSource] cancelAllDownloads];
-    [mapView release]; mapView = nil;
+    [_tileSource cancelAllDownloads];
+    self.layer.contents = nil;
+    [_tileSource release]; _tileSource = nil;
+    [_mapView release]; _mapView = nil;
     [super dealloc];
 }
 
@@ -92,7 +78,7 @@
 
     if (self.useSnapshotRenderer)
     {
-        zoom = (short)ceilf(mapView.adjustedZoomForRetinaDisplay);
+        zoom = (short)ceilf(_mapView.adjustedZoomForRetinaDisplay);
         CGFloat rectSize = bounds.size.width / powf(2.0, (float)zoom);
 
         int x1 = floor(rect.origin.x / rectSize),
@@ -102,18 +88,21 @@
 
 //        NSLog(@"Tiles from x1:%d, y1:%d to x2:%d, y2:%d @ zoom %d", x1, y1, x2, y2, zoom);
 
-        UIGraphicsPushContext(context);
-
-        for (int x=x1; x<=x2; ++x)
+        if (zoom >= _tileSource.minZoom && zoom <= _tileSource.maxZoom)
         {
-            for (int y=y1; y<=y2; ++y)
-            {
-                UIImage *tileImage = [[mapView tileSource] imageForTile:RMTileMake(x, y, zoom) inCache:[mapView tileCache]];
-                [tileImage drawInRect:CGRectMake(x * rectSize, y * rectSize, rectSize, rectSize)];
-            }
-        }
+            UIGraphicsPushContext(context);
 
-        UIGraphicsPopContext();
+            for (int x=x1; x<=x2; ++x)
+            {
+                for (int y=y1; y<=y2; ++y)
+                {
+                    UIImage *tileImage = [_tileSource imageForTile:RMTileMake(x, y, zoom) inCache:[_mapView tileCache]];
+                    [tileImage drawInRect:CGRectMake(x * rectSize, y * rectSize, rectSize, rectSize)];
+                }
+            }
+
+            UIGraphicsPopContext();
+        }
     }
     else
     {
@@ -124,42 +113,93 @@
 
         UIGraphicsPushContext(context);
 
-        UIImage *tileImage = [[mapView tileSource] imageForTile:RMTileMake(x, y, zoom) inCache:[mapView tileCache]];
+        UIImage *tileImage = nil;
+
+        if (zoom >= _tileSource.minZoom && zoom <= _tileSource.maxZoom)
+            tileImage = [_tileSource imageForTile:RMTileMake(x, y, zoom) inCache:[_mapView tileCache]];
+
+        if ( ! tileImage)
+        {
+            if (_mapView.missingTilesDepth == 0)
+            {
+                tileImage = [RMTileImage errorTile];
+            }
+            else
+            {
+                NSUInteger currentTileDepth = 1, currentZoom = zoom - currentTileDepth;
+
+                // tries to return lower zoom level tiles if a tile cannot be found
+                while ( !tileImage && currentZoom >= _tileSource.minZoom && currentTileDepth <= _mapView.missingTilesDepth)
+                {
+                    float nextX = x / powf(2.0, (float)currentTileDepth),
+                          nextY = y / powf(2.0, (float)currentTileDepth);
+                    float nextTileX = floor(nextX),
+                          nextTileY = floor(nextY);
+
+                    tileImage = [_tileSource imageForTile:RMTileMake((int)nextTileX, (int)nextTileY, currentZoom) inCache:[_mapView tileCache]];
+
+                    if (tileImage)
+                    {
+                        // crop
+                        float cropSize = 1.0 / powf(2.0, (float)currentTileDepth);
+
+                        CGRect cropBounds = CGRectMake(tileImage.size.width * (nextX - nextTileX),
+                                                       tileImage.size.height * (nextY - nextTileY),
+                                                       tileImage.size.width * cropSize,
+                                                       tileImage.size.height * cropSize);
+
+                        CGImageRef imageRef = CGImageCreateWithImageInRect([tileImage CGImage], cropBounds);
+                        tileImage = [UIImage imageWithCGImage:imageRef];
+                        CGImageRelease(imageRef);
+
+                        break;
+                    }
+
+                    currentTileDepth++;
+                    currentZoom = zoom - currentTileDepth;
+                }
+            }
+        }
+
+        if (_mapView.debugTiles)
+        {
+            UIGraphicsBeginImageContext(tileImage.size);
+
+            CGContextRef debugContext = UIGraphicsGetCurrentContext();
+
+            CGRect debugRect = CGRectMake(0, 0, tileImage.size.width, tileImage.size.height);
+
+            [tileImage drawInRect:debugRect];
+
+            UIFont *font = [UIFont systemFontOfSize:32.0];
+
+            CGContextSetStrokeColorWithColor(debugContext, [UIColor whiteColor].CGColor);
+            CGContextSetLineWidth(debugContext, 2.0);
+            CGContextSetShadowWithColor(debugContext, CGSizeMake(0.0, 0.0), 5.0, [UIColor blackColor].CGColor);
+
+            CGContextStrokeRect(debugContext, debugRect);
+
+            CGContextSetFillColorWithColor(debugContext, [UIColor whiteColor].CGColor);
+
+            NSString *debugString = [NSString stringWithFormat:@"Zoom %d", zoom];
+            CGSize debugSize1 = [debugString sizeWithFont:font];
+            [debugString drawInRect:CGRectMake(5.0, 5.0, debugSize1.width, debugSize1.height) withFont:font];
+
+            debugString = [NSString stringWithFormat:@"(%d, %d)", x, y];
+            CGSize debugSize2 = [debugString sizeWithFont:font];
+            [debugString drawInRect:CGRectMake(5.0, 5.0 + debugSize1.height + 5.0, debugSize2.width, debugSize2.height) withFont:font];
+
+            tileImage = UIGraphicsGetImageFromCurrentImageContext();
+
+            UIGraphicsEndImageContext();
+        }
+
         [tileImage drawInRect:rect];
 
         UIGraphicsPopContext();
     }
 
     [pool release]; pool = nil;
-}
-
-#pragma mark -
-#pragma mark Event handling
-
-- (void)handleSingleTap:(UIGestureRecognizer *)recognizer
-{
-    if ([delegate respondsToSelector:@selector(mapTiledLayerView:singleTapAtPoint:)])
-        [delegate mapTiledLayerView:self singleTapAtPoint:[recognizer locationInView:mapView]];
-}
-
-- (void)handleTwoFingerSingleTap:(UIGestureRecognizer *)recognizer
-{
-    if ([delegate respondsToSelector:@selector(mapTiledLayerView:twoFingerSingleTapAtPoint:)])
-        [delegate mapTiledLayerView:self twoFingerSingleTapAtPoint:[recognizer locationInView:mapView]];
-}
-
-- (void)handleLongPress:(UILongPressGestureRecognizer *)recognizer
-{
-    if (recognizer.state != UIGestureRecognizerStateBegan) return;
-
-    if ([delegate respondsToSelector:@selector(mapTiledLayerView:longPressAtPoint:)])
-        [delegate mapTiledLayerView:self longPressAtPoint:[recognizer locationInView:mapView]];
-}
-
-- (void)handleDoubleTap:(UIGestureRecognizer *)recognizer
-{
-    if ([delegate respondsToSelector:@selector(mapTiledLayerView:doubleTapAtPoint:)])
-        [delegate mapTiledLayerView:self doubleTapAtPoint:[recognizer locationInView:mapView]];
 }
 
 @end

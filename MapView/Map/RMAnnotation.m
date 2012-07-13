@@ -2,7 +2,7 @@
 //  RMAnnotation.m
 //  MapView
 //
-// Copyright (c) 2008-2009, Route-Me Contributors
+// Copyright (c) 2008-2012, Route-Me Contributors
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -50,6 +50,7 @@
 @synthesize enabled, clusteringEnabled;
 @synthesize position;
 @synthesize quadTreeNode;
+@synthesize isUserLocationAnnotation;
 
 + (id)annotationWithMapView:(RMMapView *)aMapView coordinate:(CLLocationCoordinate2D)aCoordinate andTitle:(NSString *)aTitle
 {
@@ -117,12 +118,17 @@
         self.layer = nil;
 }
 
-- (void)setPosition:(CGPoint)aPosition
+- (void)setPosition:(CGPoint)aPosition animated:(BOOL)animated
 {
     position = aPosition;
 
     if (layer)
-        layer.position = aPosition;
+        [layer setPosition:aPosition animated:animated];
+}
+
+- (void)setPosition:(CGPoint)aPosition
+{
+    [self setPosition:aPosition animated:YES];
 }
 
 - (RMMapLayer *)layer
@@ -145,7 +151,7 @@
         layer = aLayer;
         [layer retain];
         layer.annotation = self;
-        layer.position = self.position;
+        [layer setPosition:self.position animated:NO];
     }
 }
 
@@ -166,6 +172,16 @@
 {
     CGRect screenBounds = [mapView bounds];
     return [self isAnnotationWithinBounds:screenBounds];
+}
+
+- (BOOL)isAnnotationVisibleOnScreen
+{
+    return (layer != nil);
+}
+
+- (void)setIsUserLocationAnnotation:(BOOL)flag
+{
+    isUserLocationAnnotation = flag;
 }
 
 #pragma mark -

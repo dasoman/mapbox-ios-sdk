@@ -1,7 +1,7 @@
 //
-// RMWebMapSource.m
+// RMAbstractWebMapSource.m
 //
-// Copyright (c) 2009, Frank Schroeder, SharpMind GbR
+// Copyright (c) 2008-2012, Route-Me Contributors
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -27,7 +27,6 @@
 
 #import "RMAbstractWebMapSource.h"
 #import "RMTileCache.h"
-#import "RMTileImage.h"
 
 @implementation RMAbstractWebMapSource
 
@@ -46,8 +45,8 @@
 
 - (NSURL *)URLForTile:(RMTile)tile
 {
-	@throw [NSException exceptionWithName:@"RMAbstractMethodInvocation"
-                                   reason:@"URLForTile: invoked on AbstractMercatorWebSource. Override this method when instantiating abstract class."
+    @throw [NSException exceptionWithName:@"RMAbstractMethodInvocation"
+                                   reason:@"URLForTile: invoked on RMAbstractWebMapSource. Override this method when instantiating an abstract class."
                                  userInfo:nil];
 }
 
@@ -79,12 +78,12 @@
     //
     NSMutableArray *tilesData = [NSMutableArray arrayWithCapacity:[URLs count]];
 
-    for (int p = 0; p < [URLs count]; ++p)
+    for (NSUInteger p = 0; p < [URLs count]; ++p)
         [tilesData addObject:[NSNull null]];
 
     dispatch_group_t fetchGroup = dispatch_group_create();
 
-    for (int u = 0; u < [URLs count]; ++u)
+    for (NSUInteger u = 0; u < [URLs count]; ++u)
     {
         NSURL *currentURL = [URLs objectAtIndex:u];
 
@@ -92,7 +91,7 @@
         {
             NSData *tileData = nil;
 
-            for (int try = 0; tileData == nil && try < self.retryCount; ++try)
+            for (NSUInteger try = 0; tileData == nil && try < self.retryCount; ++try)
             {
                 NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:currentURL];
                 [request setTimeoutInterval:(self.waitSeconds / (CGFloat)self.retryCount)];
@@ -147,9 +146,6 @@
     {
         [[NSNotificationCenter defaultCenter] postNotificationName:RMTileRetrieved object:[NSNumber numberWithUnsignedLongLong:RMTileKey(tile)]];
     });
-
-    if (!image)
-        return [RMTileImage errorTile];
 
     return image;
 }

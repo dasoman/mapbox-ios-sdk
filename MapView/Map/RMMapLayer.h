@@ -1,7 +1,7 @@
 //
 //  RMMapLayer.h
 //
-// Copyright (c) 2008-2009, Route-Me Contributors
+// Copyright (c) 2008-2012, Route-Me Contributors
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -36,12 +36,12 @@
 {
     RMAnnotation *annotation;
 
-    /// expressed in projected meters. The anchorPoint of the image/path/etc. is plotted here.
+    // expressed in projected meters. The anchorPoint of the image/path/etc. is plotted here.
     RMProjectedPoint projectedLocation;
 
     BOOL enableDragging;
 
-    /// provided for storage of arbitrary user data
+    // provided for storage of arbitrary user data
     id userInfo;
 }
 
@@ -49,5 +49,7 @@
 @property (nonatomic, assign) RMProjectedPoint projectedLocation;
 @property (nonatomic, assign) BOOL enableDragging;
 @property (nonatomic, retain) id userInfo;
+
+- (void)setPosition:(CGPoint)position animated:(BOOL)animated;
 
 @end

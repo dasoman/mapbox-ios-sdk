@@ -40,10 +40,13 @@
 #import "FMDatabaseQueue.h"
 
 @implementation RMMBTilesSource
+{
+    RMFractalTileProjection *tileProjection;
+}
 
 - (id)initWithTileSetURL:(NSURL *)tileSetURL
 {
-	if ( ! [super init])
+	if ( ! (self = [super init]))
 		return nil;
 
 	tileProjection = [[RMFractalTileProjection alloc] initFromProjection:[self projection] 
@@ -51,7 +54,7 @@
                                                                  maxZoom:kMBTilesDefaultMaxTileZoom 
                                                                  minZoom:kMBTilesDefaultMinTileZoom];
 
-    queue = [[FMDatabaseQueue databaseQueueWithPath:[tileSetURL relativePath]] retain];
+    queue = [[FMDatabaseQueue databaseQueueWithPath:[tileSetURL path]] retain];
 
     if ( ! queue)
         return nil;
@@ -75,14 +78,9 @@
 	[super dealloc];
 }
 
-- (int)tileSideLength
+- (NSUInteger)tileSideLength
 {
-	return tileProjection.tileSideLength;
-}
-
-- (void)setTileSideLength:(NSUInteger)aTileSideLength
-{
-	[tileProjection setTileSideLength:aTileSideLength];
+    return tileProjection.tileSideLength;
 }
 
 - (UIImage *)imageForTile:(RMTile)tile inCache:(RMTileCache *)tileCache
@@ -199,12 +197,12 @@
     return maxZoom;
 }
 
-- (void)setMinZoom:(NSUInteger)aMinZoom
+- (void)setMinZoom:(float)aMinZoom
 {
     [tileProjection setMinZoom:aMinZoom];
 }
 
-- (void)setMaxZoom:(NSUInteger)aMaxZoom
+- (void)setMaxZoom:(float)aMaxZoom
 {
     [tileProjection setMaxZoom:aMaxZoom];
 }

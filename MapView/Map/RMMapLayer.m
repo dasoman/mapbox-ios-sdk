@@ -1,7 +1,7 @@
 //
 //  RMMapLayer.m
 //
-// Copyright (c) 2008-2009, Route-Me Contributors
+// Copyright (c) 2008-2012, Route-Me Contributors
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -62,6 +62,11 @@
     self.annotation = nil;
     self.userInfo = nil;
     [super dealloc];
+}
+
+- (void)setPosition:(CGPoint)position animated:(BOOL)animated
+{
+    [self setPosition:position];
 }
 
 /// return nil for certain animation keys to block core animation

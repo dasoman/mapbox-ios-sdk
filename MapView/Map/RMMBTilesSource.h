@@ -37,7 +37,6 @@
 
 #import "RMTileSource.h"
 
-@class RMFractalTileProjection;
 @class FMDatabaseQueue;
 
 #define kMBTilesDefaultTileSize 256
@@ -47,11 +46,11 @@
 
 @interface RMMBTilesSource : NSObject <RMTileSource>
 {
-    RMFractalTileProjection *tileProjection;
     FMDatabaseQueue *queue;
 }
 
 - (id)initWithTileSetURL:(NSURL *)tileSetURL;
+
 - (BOOL)coversFullWorld;
 - (NSString *)legend;
 

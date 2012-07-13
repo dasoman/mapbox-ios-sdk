@@ -25,6 +25,8 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <sys/sysctl.h>
+
 #import "RMTileCache.h"
 #import "RMMemoryCache.h"
 #import "RMDatabaseCache.h"
@@ -40,75 +42,90 @@
 @end
 
 @implementation RMTileCache
+{
+    NSMutableArray *_tileCaches;
+
+    // The memory cache, if we have one
+    // This one has its own variable because we want to propagate cache hits down in
+    // the cache hierarchy up to the memory cache
+    RMMemoryCache *_memoryCache;
+    NSTimeInterval _expiryPeriod;
+
+    dispatch_queue_t _tileCacheQueue;
+}
 
 - (id)initWithExpiryPeriod:(NSTimeInterval)period
 {
-	if (!(self = [super init]))
-		return nil;
+    if (!(self = [super init]))
+        return nil;
 
-	caches = [[NSMutableArray alloc] init];
-    memoryCache = nil;
-    expiryPeriod = period;
-    
-	id cacheCfg = [[RMConfiguration configuration] cacheConfiguration];	
-	if (!cacheCfg)
-		cacheCfg = [NSArray arrayWithObjects:
+    _tileCaches = [[NSMutableArray alloc] init];
+    _tileCacheQueue = dispatch_queue_create("routeme.tileCacheQueue", DISPATCH_QUEUE_CONCURRENT);
+
+    _memoryCache = nil;
+    _expiryPeriod = period;
+
+    id cacheCfg = [[RMConfiguration configuration] cacheConfiguration];
+    if (!cacheCfg)
+        cacheCfg = [NSArray arrayWithObjects:
                     [NSDictionary dictionaryWithObject: @"memory-cache" forKey: @"type"],
                     [NSDictionary dictionaryWithObject: @"db-cache"     forKey: @"type"],
                     nil];
 
-	for (id cfg in cacheCfg) 
-	{
-		id <RMTileCache> newCache = nil;
+    for (id cfg in cacheCfg)
+    {
+        id <RMTileCache> newCache = nil;
 
-		@try {
+        @try {
 
-			NSString *type = [cfg valueForKey:@"type"];
+            NSString *type = [cfg valueForKey:@"type"];
 
-			if ([@"memory-cache" isEqualToString:type])
+            if ([@"memory-cache" isEqualToString:type])
             {
-				memoryCache = [[self memoryCacheWithConfig:cfg] retain];
+                _memoryCache = [[self memoryCacheWithConfig:cfg] retain];
                 continue;
             }
 
-			if ([@"db-cache" isEqualToString:type])
-				newCache = [self databaseCacheWithConfig:cfg];
+            if ([@"db-cache" isEqualToString:type])
+                newCache = [self databaseCacheWithConfig:cfg];
 
-			if (newCache)
-				[caches addObject:newCache];
-			else
-				RMLog(@"failed to create cache of type %@", type);
+            if (newCache)
+                [_tileCaches addObject:newCache];
+            else
+                RMLog(@"failed to create cache of type %@", type);
 
-		}
-		@catch (NSException * e) {
-			RMLog(@"*** configuration error: %@", [e reason]);
-		}
-	}
+        }
+        @catch (NSException * e) {
+            RMLog(@"*** configuration error: %@", [e reason]);
+        }
+    }
 
-	return self;
+    return self;
 }
 
 - (id)init
 {
     if (!(self = [self initWithExpiryPeriod:0]))
         return nil;
-    
+
     return self;
 }
 
 - (void)dealloc
 {
-    [memoryCache release]; memoryCache = nil;
-	[caches release]; caches = nil;
+    dispatch_barrier_sync(_tileCacheQueue, ^{
+        [_memoryCache release]; _memoryCache = nil;
+        [_tileCaches release]; _tileCaches = nil;
+    });
+
 	[super dealloc];
 }
 
 - (void)addCache:(id <RMTileCache>)cache
 {
-    @synchronized (caches)
-    {
-        [caches addObject:cache];
-    }
+    dispatch_barrier_async(_tileCacheQueue, ^{
+        [_tileCaches addObject:cache];
+    });
 }
 
 + (NSNumber *)tileHash:(RMTile)tile
@@ -119,26 +136,27 @@
 // Returns the cached image if it exists. nil otherwise.
 - (UIImage *)cachedImage:(RMTile)tile withCacheKey:(NSString *)aCacheKey
 {
-    UIImage *image = [memoryCache cachedImage:tile withCacheKey:aCacheKey];
+    __block UIImage *image = [_memoryCache cachedImage:tile withCacheKey:aCacheKey];
 
     if (image)
         return image;
 
-    @synchronized (caches)
-    {
-        for (id <RMTileCache> cache in caches)
+    dispatch_sync(_tileCacheQueue, ^{
+
+        for (id <RMTileCache> cache in _tileCaches)
         {
-            image = [cache cachedImage:tile withCacheKey:aCacheKey];
+            image = [[cache cachedImage:tile withCacheKey:aCacheKey] retain];
 
             if (image != nil)
             {
-                [memoryCache addImage:image forTile:tile withCacheKey:aCacheKey];
-                return image;
+                [_memoryCache addImage:image forTile:tile withCacheKey:aCacheKey];
+                break;
             }
         }
-    }
 
-	return nil;
+    });
+
+	return [image autorelease];
 }
 
 - (void)addImage:(UIImage *)image forTile:(RMTile)tile withCacheKey:(NSString *)aCacheKey
@@ -146,43 +164,47 @@
     if (!image || !aCacheKey)
         return;
 
-    [memoryCache addImage:image forTile:tile withCacheKey:aCacheKey];
+    [_memoryCache addImage:image forTile:tile withCacheKey:aCacheKey];
 
-    @synchronized (caches)
-    {
-        for (id <RMTileCache> cache in caches)
+    dispatch_sync(_tileCacheQueue, ^{
+
+        for (id <RMTileCache> cache in _tileCaches)
         {	
             if ([cache respondsToSelector:@selector(addImage:forTile:withCacheKey:)])
                 [cache addImage:image forTile:tile withCacheKey:aCacheKey];
         }
-    }
+
+    });
 }
 
 - (void)didReceiveMemoryWarning
 {
 	LogMethod();
-    [memoryCache didReceiveMemoryWarning];
 
-    @synchronized (caches)
-    {
-        for (id<RMTileCache> cache in caches)
+    [_memoryCache didReceiveMemoryWarning];
+
+    dispatch_sync(_tileCacheQueue, ^{
+
+        for (id<RMTileCache> cache in _tileCaches)
         {
             [cache didReceiveMemoryWarning];
         }
-    }
+
+    });
 }
 
 - (void)removeAllCachedImages
 {
-    [memoryCache removeAllCachedImages];
+    [_memoryCache removeAllCachedImages];
 
-    @synchronized (caches)
-    {
-        for (id<RMTileCache> cache in caches)
+    dispatch_sync(_tileCacheQueue, ^{
+
+        for (id<RMTileCache> cache in _tileCaches)
         {
             [cache removeAllCachedImages];
         }
-    }
+
+    });
 }
 
 @end
@@ -191,13 +213,87 @@
 
 @implementation RMTileCache (Configuration)
 
++ (NSString *)sysctlbyname:(NSString *)name
+{
+	size_t len;
+    sysctlbyname([name UTF8String], NULL, &len, NULL, 0);
+
+    char *sysctlResult = malloc(len);
+	sysctlbyname([name UTF8String], sysctlResult, &len, NULL, 0);
+
+	NSString *result = [NSString stringWithCString:sysctlResult encoding:NSASCIIStringEncoding];
+	free(sysctlResult);
+
+	return result;
+}
+
+- (NSDictionary *)predicateValues
+{
+    NSString *machine = [RMTileCache sysctlbyname:@"hw.machine"];
+
+    NSMutableDictionary *predicateValues = [NSMutableDictionary dictionaryWithObjectsAndKeys:
+                                            [[UIDevice currentDevice] model], @"model",
+                                            machine, @"machine",
+                                            [[UIDevice currentDevice] systemName], @"systemName",
+                                            [NSNumber numberWithFloat:[[[UIDevice currentDevice] systemVersion] floatValue]], @"systemVersion",
+                                            [NSNumber numberWithInt:[[UIDevice currentDevice] userInterfaceIdiom]], @"userInterfaceIdiom",
+                                            nil];
+
+    if ( ! ([machine isEqualToString:@"i386"] || [machine isEqualToString:@"x86_64"]))
+    {
+        NSNumber *machineNumber = [NSNumber numberWithFloat:[[[machine stringByTrimmingCharactersInSet:[NSCharacterSet letterCharacterSet]] stringByReplacingOccurrencesOfString:@"," withString:@"."] floatValue]];
+
+        if ( ! machineNumber)
+            machineNumber = [NSNumber numberWithFloat:0.0];
+
+        [predicateValues setObject:machineNumber forKey:@"machineNumber"];
+    }
+    else
+    {
+        [predicateValues setObject:[NSNumber numberWithFloat:0.0] forKey:@"machineNumber"];
+    }
+
+    // A predicate might be:
+    // (self.model = 'iPad' and self.machineNumber >= 3) or (self.machine = 'x86_64')
+    // See NSPredicate
+
+//    NSLog(@"Predicate values:\n%@", [predicateValues description]);
+
+    return predicateValues;
+}
+
 - (id <RMTileCache>)memoryCacheWithConfig:(NSDictionary *)cfg
 {
-	NSNumber *capacity = [cfg objectForKey:@"capacity"];
-	if (capacity == nil) 
-        capacity = [NSNumber numberWithInt:32];
-    
-	return [[[RMMemoryCache alloc] initWithCapacity:[capacity intValue]] autorelease];
+    NSUInteger capacity = 32;
+
+	NSNumber *capacityNumber = [cfg objectForKey:@"capacity"];
+	if (capacityNumber != nil)
+        capacity = [capacityNumber unsignedIntegerValue];
+
+    NSArray *predicates = [cfg objectForKey:@"predicates"];
+
+    if (predicates)
+    {
+        NSDictionary *predicateValues = [self predicateValues];
+
+        for (NSDictionary *predicateDescription in predicates)
+        {
+            NSString *predicate = [predicateDescription objectForKey:@"predicate"];
+            if ( ! predicate)
+                continue;
+
+            if ( ! [[NSPredicate predicateWithFormat:predicate] evaluateWithObject:predicateValues])
+                continue;
+
+            capacityNumber = [predicateDescription objectForKey:@"capacity"];
+            if (capacityNumber != nil)
+                capacity = [capacityNumber unsignedIntegerValue];
+        }
+    }
+
+    RMLog(@"Memory cache configuration: {capacity : %d}", capacity);
+
+	return [[[RMMemoryCache alloc] initWithCapacity:capacity] autorelease];
 }
 
 - (id <RMTileCache>)databaseCacheWithConfig:(NSDictionary *)cfg
@@ -208,50 +304,100 @@
     NSUInteger capacity = 1000;
     NSUInteger minimalPurge = capacity / 10;
 
+    // Defaults
+
     NSNumber *capacityNumber = [cfg objectForKey:@"capacity"];
+
     if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad && [cfg objectForKey:@"capacity-ipad"])
+    {
+        NSLog(@"***** WARNING: deprecated config option capacity-ipad, use a predicate instead: -[%@ %@] (line %d)", self, NSStringFromSelector(_cmd), __LINE__);
         capacityNumber = [cfg objectForKey:@"capacity-ipad"];
-
-    if (capacityNumber != nil) {
-        NSInteger value = [capacityNumber intValue];
-
-        // 0 is valid: it means no capacity limit
-        if (value >= 0) {
-            capacity =  value;
-            minimalPurge = MAX(1,capacity / 10);
-        } else
-            RMLog(@"illegal value for capacity: %d", value);
     }
 
     NSString *strategyStr = [cfg objectForKey:@"strategy"];
-    if (strategyStr != nil) {
+    NSNumber *useCacheDirNumber = [cfg objectForKey:@"useCachesDirectory"];
+    NSNumber *minimalPurgeNumber = [cfg objectForKey:@"minimalPurge"];
+    NSNumber *expiryPeriodNumber = [cfg objectForKey:@"expiryPeriod"];
+
+    NSArray *predicates = [cfg objectForKey:@"predicates"];
+
+    if (predicates)
+    {
+        NSDictionary *predicateValues = [self predicateValues];
+
+        for (NSDictionary *predicateDescription in predicates)
+        {
+            NSString *predicate = [predicateDescription objectForKey:@"predicate"];
+            if ( ! predicate)
+                continue;
+
+            if ( ! [[NSPredicate predicateWithFormat:predicate] evaluateWithObject:predicateValues])
+                continue;
+
+            if ([predicateDescription objectForKey:@"capacity"])
+                capacityNumber = [predicateDescription objectForKey:@"capacity"];
+            if ([predicateDescription objectForKey:@"strategy"])
+                strategyStr = [predicateDescription objectForKey:@"strategy"];
+            if ([predicateDescription objectForKey:@"useCachesDirectory"])
+                useCacheDirNumber = [predicateDescription objectForKey:@"useCachesDirectory"];
+            if ([predicateDescription objectForKey:@"minimalPurge"])
+                minimalPurgeNumber = [predicateDescription objectForKey:@"minimalPurge"];
+            if ([predicateDescription objectForKey:@"expiryPeriod"])
+                expiryPeriodNumber = [predicateDescription objectForKey:@"expiryPeriod"];
+        }
+    }
+
+    // Check the values
+
+    if (capacityNumber != nil)
+    {
+        NSInteger value = [capacityNumber intValue];
+
+        // 0 is valid: it means no capacity limit
+        if (value >= 0)
+        {
+            capacity =  value;
+            minimalPurge = MAX(1,capacity / 10);
+        }
+        else
+        {
+            RMLog(@"illegal value for capacity: %d", value);
+        }
+    }
+
+    if (strategyStr != nil)
+    {
         if ([strategyStr caseInsensitiveCompare:@"FIFO"] == NSOrderedSame) strategy = RMCachePurgeStrategyFIFO;
         if ([strategyStr caseInsensitiveCompare:@"LRU"] == NSOrderedSame) strategy = RMCachePurgeStrategyLRU;
     }
+    else
+    {
+        strategyStr = @"FIFO";
+    }
 
-    NSNumber *useCacheDirNumber = [cfg objectForKey:@"useCachesDirectory"];
     if (useCacheDirNumber != nil)
         useCacheDir = [useCacheDirNumber boolValue];
 
-    NSNumber *minimalPurgeNumber = [cfg objectForKey:@"minimalPurge"];
-    if (minimalPurgeNumber != nil && capacity != 0) {
+    if (minimalPurgeNumber != nil && capacity != 0)
+    {
         NSUInteger value = [minimalPurgeNumber unsignedIntValue];
-        if (value > 0 && value<=capacity) {
+
+        if (value > 0 && value<=capacity)
             minimalPurge = value;
-        } else {
+        else
             RMLog(@"minimalPurge must be at least one and at most the cache capacity");
-        }
     }
-    
-    NSNumber *expiryPeriodNumber = [cfg objectForKey:@"expiryPeriod"];
+
     if (expiryPeriodNumber != nil)
-        expiryPeriod = [expiryPeriodNumber intValue];
+        _expiryPeriod = [expiryPeriodNumber doubleValue];
+
+    RMLog(@"Database cache configuration: {capacity : %d, strategy : %@, minimalPurge : %d, expiryPeriod: %.0f, useCacheDir : %@}", capacity, strategyStr, minimalPurge, _expiryPeriod, useCacheDir ? @"YES" : @"NO");
 
     RMDatabaseCache *dbCache = [[[RMDatabaseCache alloc] initUsingCacheDir:useCacheDir] autorelease];
     [dbCache setCapacity:capacity];
     [dbCache setPurgeStrategy:strategy];
     [dbCache setMinimalPurge:minimalPurge];
-    [dbCache setExpiryPeriod:expiryPeriod];
+    [dbCache setExpiryPeriod:_expiryPeriod];
 
     return dbCache;
 }

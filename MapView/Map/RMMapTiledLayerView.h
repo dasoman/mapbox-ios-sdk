@@ -6,29 +6,16 @@
 //  Copyright (c) 2011 Alpstein. All rights reserved.
 //
 
-@class RMMapView, RMMapTiledLayerView;
+#import "RMTileSource.h"
 
-@protocol RMMapTiledLayerViewDelegate <NSObject>
-@optional
-
-// points are in the mapview coordinate space
-- (void)mapTiledLayerView:(RMMapTiledLayerView *)aTiledLayerView singleTapAtPoint:(CGPoint)aPoint;
-- (void)mapTiledLayerView:(RMMapTiledLayerView *)aTiledLayerView doubleTapAtPoint:(CGPoint)aPoint;
-- (void)mapTiledLayerView:(RMMapTiledLayerView *)aTiledLayerView twoFingerSingleTapAtPoint:(CGPoint)aPoint;
-- (void)mapTiledLayerView:(RMMapTiledLayerView *)aTiledLayerView longPressAtPoint:(CGPoint)aPoint;
-
-@end
+@class RMMapView;
 
 @interface RMMapTiledLayerView : UIView
-{
-    id <RMMapTiledLayerViewDelegate> delegate;
-    RMMapView *mapView;
-}
-
-@property (nonatomic, assign) id <RMMapTiledLayerViewDelegate> delegate;
 
 @property (nonatomic, assign) BOOL useSnapshotRenderer;
 
-- (id)initWithFrame:(CGRect)frame mapView:(RMMapView *)aMapView;
+@property (nonatomic, readonly) id <RMTileSource> tileSource;
+
+- (id)initWithFrame:(CGRect)frame mapView:(RMMapView *)aMapView forTileSource:(id <RMTileSource>)aTileSource;
 
 @end
