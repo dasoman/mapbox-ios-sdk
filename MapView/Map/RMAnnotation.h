@@ -2,7 +2,7 @@
 //  RMAnnotation.h
 //  MapView
 //
-// Copyright (c) 2008-2009, Route-Me Contributors
+// Copyright (c) 2008-2012, Route-Me Contributors
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -73,14 +73,32 @@
 // This is for the QuadTree. Don't mess this up.
 @property (nonatomic, assign) RMQuadTreeNode *quadTreeNode;
 
+// This is for filtering framework-provided annotations.
+@property (nonatomic, assign, readonly) BOOL isUserLocationAnnotation;
+
+#pragma mark -
+
 + (id)annotationWithMapView:(RMMapView *)aMapView coordinate:(CLLocationCoordinate2D)aCoordinate andTitle:(NSString *)aTitle;
 - (id)initWithMapView:(RMMapView *)aMapView coordinate:(CLLocationCoordinate2D)aCoordinate andTitle:(NSString *)aTitle;
 
 - (void)setBoundingBoxCoordinatesSouthWest:(CLLocationCoordinate2D)southWest northEast:(CLLocationCoordinate2D)northEast;
 - (void)setBoundingBoxFromLocations:(NSArray *)locations;
 
-- (BOOL)isAnnotationOnScreen;
+#pragma mark -
+
+// YES if the annotation is on the screen, regardles if clustered or not
+@property (nonatomic, readonly) BOOL isAnnotationOnScreen;
+
 - (BOOL)isAnnotationWithinBounds:(CGRect)bounds;
+
+// NO if the annotation is currently offscreen or clustered
+@property (nonatomic, readonly) BOOL isAnnotationVisibleOnScreen;
+
+#pragma mark -
+
+- (void)setPosition:(CGPoint)position animated:(BOOL)animated;
+
+#pragma mark -
 
 // Used internally
 @property (nonatomic, retain) RMMapView *mapView;

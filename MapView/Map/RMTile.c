@@ -1,7 +1,7 @@
 //
 //  RMTile.c
 //
-// Copyright (c) 2008-2009, Route-Me Contributors
+// Copyright (c) 2008-2012, Route-Me Contributors
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -97,7 +97,7 @@ RMTileRect RMTileRectRound(RMTileRect rect)
 }
 
 // Dump a description of the tile to the console
-void RMTileDump(RMTile tile)
+void RMLogTile(RMTile tile)
 {
     printf("Tile at (%d,%d), zoom %hi\n", tile.x, tile.y, tile.zoom);
 }

@@ -1,7 +1,7 @@
-///
+//
 //  RMPath.m
 //
-// Copyright (c) 2008-2009, Route-Me Contributors
+// Copyright (c) 2008-2012, Route-Me Contributors
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -423,7 +423,7 @@
     }
 }
 
-- (void)setPosition:(CGPoint)newPosition
+- (void)setPosition:(CGPoint)newPosition animated:(BOOL)animated
 {
     if (CGPointEqualToPoint(newPosition, super.position) && CGRectEqualToRect(self.bounds, previousBounds)) return;
 

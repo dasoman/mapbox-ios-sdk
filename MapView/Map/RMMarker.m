@@ -1,7 +1,7 @@
 //
 //  RMMarker.m
 //
-// Copyright (c) 2008-2009, Route-Me Contributors
+// Copyright (c) 2008-2012, Route-Me Contributors
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -35,6 +35,8 @@
 @synthesize textBackgroundColor;
 
 #define defaultMarkerAnchorPoint CGPointMake(0.5, 0.5)
+
+#define kCachesPath [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) objectAtIndex:0]
 
 + (UIFont *)defaultFont
 {
@@ -72,6 +74,83 @@
     self.label = nil;
 
     return self;
+}
+
+- (id)initWithMapBoxMarkerImage
+{
+    return [self initWithMapBoxMarkerImage:nil tintColor:nil size:RMMarkerMapBoxImageSizeMedium];
+}
+
+- (id)initWithMapBoxMarkerImage:(NSString *)symbolName
+{
+    return [self initWithMapBoxMarkerImage:symbolName tintColor:nil size:RMMarkerMapBoxImageSizeMedium];
+}
+
+- (id)initWithMapBoxMarkerImage:(NSString *)symbolName tintColor:(UIColor *)color
+{
+    return [self initWithMapBoxMarkerImage:symbolName tintColor:color size:RMMarkerMapBoxImageSizeMedium];
+}
+
+- (id)initWithMapBoxMarkerImage:(NSString *)symbolName tintColor:(UIColor *)color size:(RMMarkerMapBoxImageSize)size
+{
+    NSString *sizeString;
+    
+    switch (size)
+    {
+        case RMMarkerMapBoxImageSizeSmall:
+            sizeString = @"small";
+            break;
+        
+        case RMMarkerMapBoxImageSizeMedium:
+        default:
+            sizeString = @"medium";
+            break;
+        
+        case RMMarkerMapBoxImageSizeLarge:
+            sizeString = @"large";
+            break;
+    }
+    
+    NSString *colorHex;
+    
+    if (color)
+    {
+        CGFloat red, green, blue, alpha;
+
+        if ([color getRed:&red green:&green blue:&blue alpha:&alpha])
+            colorHex = [NSString stringWithFormat:@"%02x%02x%02x", ((NSUInteger)red * 255), ((NSUInteger)green * 255), ((NSUInteger)blue * 255)];
+    }
+    
+    return [self initWithMapBoxMarkerImage:symbolName tintColorHex:colorHex sizeString:sizeString];
+}
+
+- (id)initWithMapBoxMarkerImage:(NSString *)symbolName tintColorHex:(NSString *)colorHex
+{
+    return [self initWithMapBoxMarkerImage:symbolName tintColorHex:colorHex sizeString:@"medium"];
+}
+
+- (id)initWithMapBoxMarkerImage:(NSString *)symbolName tintColorHex:(NSString *)colorHex sizeString:(NSString *)sizeString
+{
+    BOOL useRetina = ([[UIScreen mainScreen] scale] > 1.0);
+    
+    NSURL *imageURL = [NSURL URLWithString:[NSString stringWithFormat:@"http://a.tiles.mapbox.com/v3/marker/pin-%@%@%@.png%@",
+                                               (sizeString ? [sizeString substringToIndex:1] : @"m"), 
+                                               (symbolName ? [@"-" stringByAppendingString:symbolName] : nil), 
+                                               (colorHex   ? [@"+" stringByAppendingString:[colorHex stringByReplacingOccurrencesOfString:@"#" withString:@""]] : nil),
+                                               (useRetina  ? @"@2x" : @"")]];
+    
+    UIImage *image;
+    
+    NSString *rearrangedFilename = [[imageURL lastPathComponent] stringByReplacingOccurrencesOfString:@".png@2x" withString:@"@2x.png"]; // for scale detection
+    
+    NSString *cachePath = [NSString stringWithFormat:@"%@/%@", kCachesPath, rearrangedFilename];
+    
+    if ((image = [UIImage imageWithContentsOfFile:cachePath]) && image)
+        return [self initWithUIImage:image];
+    
+    [[NSFileManager defaultManager] createFileAtPath:cachePath contents:[NSData dataWithContentsOfURL:imageURL] attributes:nil];
+    
+    return [self initWithUIImage:[UIImage imageWithContentsOfFile:cachePath]];
 }
 
 - (void)dealloc
@@ -114,6 +193,23 @@
         label = [aView retain];
         [self addSublayer:[label layer]];
     }
+}
+
+- (void)setTextBackgroundColor:(UIColor *)newTextBackgroundColor
+{
+    [textBackgroundColor autorelease];
+    textBackgroundColor = [newTextBackgroundColor retain];
+
+    self.label.backgroundColor = textBackgroundColor;
+}
+
+- (void)setTextForegroundColor:(UIColor *)newTextForegroundColor
+{
+    [textForegroundColor autorelease];
+    textForegroundColor = [newTextForegroundColor retain];
+
+    if ([self.label respondsToSelector:@selector(setTextColor:)])
+        ((UILabel *)self.label).textColor = textForegroundColor;
 }
 
 - (void)changeLabelUsingText:(NSString *)text
