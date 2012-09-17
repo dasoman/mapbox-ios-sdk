@@ -11,6 +11,9 @@
 #import "RMMapView.h"
 #import "RMTileSource.h"
 #import "RMTileImage.h"
+#import "RMTileCache.h"
+#import "RMMBTilesSource.h"
+#import "RMDBMapSource.h"
 
 @implementation RMMapTiledLayerView
 {
@@ -116,7 +119,34 @@
         UIImage *tileImage = nil;
 
         if (zoom >= _tileSource.minZoom && zoom <= _tileSource.maxZoom)
-            tileImage = [_tileSource imageForTile:RMTileMake(x, y, zoom) inCache:[_mapView tileCache]];
+        {
+            if ([_tileSource isKindOfClass:[RMMBTilesSource class]] || [_tileSource isKindOfClass:[RMDBMapSource class]])
+            {
+                // for local tiles, query the source directly since trivial blocking
+                //
+                tileImage = [_tileSource imageForTile:RMTileMake(x, y, zoom) inCache:[_mapView tileCache]];
+            }
+            else
+            {
+                // for non-local tiles, consult cache directly first, else fetch asynchronously
+                //
+                tileImage = [[_mapView tileCache] cachedImage:RMTileMake(x, y, zoom) withCacheKey:[_tileSource uniqueTilecacheKey]];
+
+                if ( ! tileImage)
+                {
+                    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(void)
+                    {
+                        if ([_tileSource imageForTile:RMTileMake(x, y, zoom) inCache:[_mapView tileCache]])
+                        {
+                            dispatch_async(dispatch_get_main_queue(), ^(void)
+                            {
+                                [self.layer setNeedsDisplay];
+                            });
+                        }
+                    });
+                }
+            }
+        }
 
         if ( ! tileImage)
         {
