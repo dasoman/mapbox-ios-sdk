@@ -133,17 +133,15 @@
 {
     BOOL useRetina = ([[UIScreen mainScreen] scale] > 1.0);
     
-    NSURL *imageURL = [NSURL URLWithString:[NSString stringWithFormat:@"http://a.tiles.mapbox.com/v3/marker/pin-%@%@%@.png%@",
+    NSURL *imageURL = [NSURL URLWithString:[NSString stringWithFormat:@"http://a.tiles.mapbox.com/v3/marker/pin-%@%@%@%@.png",
                                                (sizeString ? [sizeString substringToIndex:1] : @"m"), 
-                                               (symbolName ? [@"-" stringByAppendingString:symbolName] : nil), 
-                                               (colorHex   ? [@"+" stringByAppendingString:[colorHex stringByReplacingOccurrencesOfString:@"#" withString:@""]] : nil),
+                                               (symbolName ? [@"-" stringByAppendingString:symbolName] : @""),
+                                               (colorHex   ? [@"+" stringByAppendingString:[colorHex stringByReplacingOccurrencesOfString:@"#" withString:@""]] : @""),
                                                (useRetina  ? @"@2x" : @"")]];
     
     UIImage *image;
     
-    NSString *rearrangedFilename = [[imageURL lastPathComponent] stringByReplacingOccurrencesOfString:@".png@2x" withString:@"@2x.png"]; // for scale detection
-    
-    NSString *cachePath = [NSString stringWithFormat:@"%@/%@", kCachesPath, rearrangedFilename];
+    NSString *cachePath = [NSString stringWithFormat:@"%@/%@", kCachesPath, [imageURL lastPathComponent]];
     
     if ((image = [UIImage imageWithContentsOfFile:cachePath]) && image)
         return [self initWithUIImage:image];

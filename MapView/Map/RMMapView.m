@@ -46,6 +46,7 @@
 
 #import "RMMapTiledLayerView.h"
 #import "RMMapOverlayView.h"
+#import "RMLoadingTileView.h"
 
 #import "RMUserLocation.h"
 
@@ -64,16 +65,21 @@
 
 #pragma mark --- end constants ----
 
-@interface RMMapView (PrivateMethods)
+@interface RMMapView (PrivateMethods) <UIScrollViewDelegate, UIGestureRecognizerDelegate, RMMapScrollViewDelegate, CLLocationManagerDelegate>
 
 @property (nonatomic, retain) RMUserLocation *userLocation;
 
 - (void)createMapView;
 
+- (void)registerMoveEventByUser:(BOOL)wasUserEvent;
+- (void)registerZoomEventByUser:(BOOL)wasUserEvent;
+
 - (void)correctPositionOfAllAnnotations;
 - (void)correctPositionOfAllAnnotationsIncludingInvisibles:(BOOL)correctAllLayers animated:(BOOL)animated;
 
 - (void)correctMinZoomScaleForBoundingMask;
+
+- (void)updateHeadingForDeviceOrientation;
 
 @end
 
@@ -130,6 +136,7 @@
     RMMapScrollView *_mapScrollView;
     RMMapOverlayView *_overlayView;
     UIView *_tiledLayersSuperview;
+    RMLoadingTileView *_loadingTileView;
 
     RMProjection *_projection;
     RMFractalTileProjection *_mercatorToTileProjection;
@@ -152,16 +159,25 @@
     CGPoint _lastDraggingTranslation;
     RMAnnotation *_draggedAnnotation;
 
-    CLLocationManager *locationManager;
-    RMUserLocation *userLocation;
-    BOOL showsUserLocation;
-    RMUserTrackingMode userTrackingMode;
+    CLLocationManager *_locationManager;
 
-    UIImageView *userLocationTrackingView;
-    UIImageView *userHeadingTrackingView;
+    RMAnnotation *_accuracyCircleAnnotation;
+    RMAnnotation *_trackingHaloAnnotation;
 
-    UIViewController *viewControllerPresentingAttribution;
-    UIButton *attributionButton;
+    UIImageView *_userLocationTrackingView;
+    UIImageView *_userHeadingTrackingView;
+    UIImageView *_userHaloTrackingView;
+
+    UIViewController *_viewControllerPresentingAttribution;
+    UIButton *_attributionButton;
+
+    CGAffineTransform _mapTransform;
+    CATransform3D _annotationTransform;
+
+    NSOperationQueue *_moveDelegateQueue;
+    NSOperationQueue *_zoomDelegateQueue;
+
+    UIImageView *_logoBug;
 }
 
 @synthesize decelerationMode = _decelerationMode;
@@ -174,11 +190,16 @@
 @synthesize quadTree = _quadTree;
 @synthesize enableClustering = _enableClustering;
 @synthesize positionClusterMarkersAtTheGravityCenter = _positionClusterMarkersAtTheGravityCenter;
+@synthesize orderClusterMarkersAboveOthers = _orderClusterMarkersOnTop;
 @synthesize clusterMarkerSize = _clusterMarkerSize, clusterAreaSize = _clusterAreaSize;
 @synthesize adjustTilesForRetinaDisplay = _adjustTilesForRetinaDisplay;
-@synthesize userLocation, showsUserLocation, userTrackingMode;
+@synthesize userLocation = _userLocation;
+@synthesize showsUserLocation = _showsUserLocation;
+@synthesize userTrackingMode = _userTrackingMode;
+@synthesize displayHeadingCalibration = _displayHeadingCalibration;
 @synthesize missingTilesDepth = _missingTilesDepth;
 @synthesize debugTiles = _debugTiles;
+@synthesize showLogoBug = _showLogoBug;
 
 #pragma mark -
 #pragma mark Initialization
@@ -212,7 +233,7 @@
 
     _boundingMask = RMMapMinWidthBound;
     _adjustTilesForRetinaDisplay = NO;
-    _missingTilesDepth = 0;
+    _missingTilesDepth = 1;
     _debugTiles = NO;
 
     _annotations = [NSMutableSet new];
@@ -222,11 +243,24 @@
     _clusterMarkerSize = CGSizeMake(100.0, 100.0);
     _clusterAreaSize = CGSizeMake(150.0, 150.0);
 
+    _moveDelegateQueue = [[NSOperationQueue alloc] init];
+    [_moveDelegateQueue setMaxConcurrentOperationCount:1];
+
+    _zoomDelegateQueue = [[NSOperationQueue alloc] init];
+    [_zoomDelegateQueue setMaxConcurrentOperationCount:1];
+
     [self setTileCache:[[[RMTileCache alloc] init] autorelease]];
 
-    [self setBackgroundView:[[[UIView alloc] initWithFrame:[self bounds]] autorelease]];
     if (backgroundImage)
+    {
+        [self setBackgroundView:[[[UIView alloc] initWithFrame:[self bounds]] autorelease]];
         self.backgroundView.layer.contents = (id)backgroundImage.CGImage;
+    }
+    else
+    {
+        _loadingTileView = [[[RMLoadingTileView alloc] initWithFrame:self.bounds] autorelease];
+        [self setBackgroundView:_loadingTileView];
+    }
 
     if (minZoomLevel < newTilesource.minZoom) minZoomLevel = newTilesource.minZoom;
     if (maxZoomLevel > newTilesource.maxZoom) maxZoomLevel = newTilesource.maxZoom;
@@ -237,9 +271,29 @@
     [self setTileSource:newTilesource];
     [self setCenterCoordinate:initialCenterCoordinate animated:NO];
 
+    [self setDecelerationMode:RMMapDecelerationFast];
+    [self setBoundingMask:RMMapMinHeightBound];
+
+    self.showLogoBug = YES;
+
+    self.displayHeadingCalibration = YES;
+
+    _mapTransform = CGAffineTransformIdentity;
+    _annotationTransform = CATransform3DIdentity;
+
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(handleMemoryWarningNotification:)
                                                  name:UIApplicationDidReceiveMemoryWarningNotification
+                                               object:nil];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleWillChangeOrientationNotification:)
+                                                 name:UIApplicationWillChangeStatusBarOrientationNotification
+                                               object:nil];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleDidChangeOrientationNotification:)
+                                                 name:UIApplicationDidChangeStatusBarOrientationNotification
                                                object:nil];
 
     RMLog(@"Map initialised. tileSource:%@, minZoom:%f, maxZoom:%f, zoom:%f at {%f,%f}", newTilesource, self.minZoom, self.maxZoom, self.zoom, initialCenterCoordinate.longitude, initialCenterCoordinate.latitude);
@@ -342,6 +396,10 @@
     [self setDelegate:nil];
     [self setBackgroundView:nil];
     [self setQuadTree:nil];
+    [_moveDelegateQueue cancelAllOperations];
+    [_moveDelegateQueue release]; _moveDelegateQueue = nil;
+    [_zoomDelegateQueue cancelAllOperations];
+    [_zoomDelegateQueue release]; _zoomDelegateQueue = nil;
     [_draggedAnnotation release]; _draggedAnnotation = nil;
     [_annotations release]; _annotations = nil;
     [_visibleAnnotations release]; _visibleAnnotations = nil;
@@ -354,11 +412,18 @@
     [_projection release]; _projection = nil;
     [_mercatorToTileProjection release]; _mercatorToTileProjection = nil;
     [self setTileCache:nil];
-    [locationManager release]; locationManager = nil;
-    [userLocation release]; userLocation = nil;
-    [userLocationTrackingView release]; userLocationTrackingView = nil;
-    [userHeadingTrackingView release]; userHeadingTrackingView = nil;
-    [attributionButton release]; attributionButton = nil;
+    _locationManager.delegate = nil;
+    [_locationManager stopUpdatingLocation];
+    [_locationManager stopUpdatingHeading];
+    [_locationManager release]; _locationManager = nil;
+    [_userLocation release]; _userLocation = nil;
+    [_accuracyCircleAnnotation release]; _accuracyCircleAnnotation = nil;
+    [_trackingHaloAnnotation release]; _trackingHaloAnnotation = nil;
+    [_userLocationTrackingView release]; _userLocationTrackingView = nil;
+    [_userHeadingTrackingView release]; _userHeadingTrackingView = nil;
+    [_userHaloTrackingView release]; _userHaloTrackingView = nil;
+    [_attributionButton release]; _attributionButton = nil;
+    [_logoBug release]; _logoBug = nil;
     [super dealloc];
 }
 
@@ -373,6 +438,19 @@
 - (void)handleMemoryWarningNotification:(NSNotification *)notification
 {
 	[self didReceiveMemoryWarning];
+}
+
+- (void)handleWillChangeOrientationNotification:(NSNotification *)notification
+{
+    // send a dummy heading update to force re-rotation
+    //
+    if (self.userTrackingMode == RMUserTrackingModeFollowWithHeading)
+        [self locationManager:_locationManager didUpdateHeading:_locationManager.heading];
+}
+
+- (void)handleDidChangeOrientationNotification:(NSNotification *)notification
+{
+    [self updateHeadingForDeviceOrientation];
 }
 
 - (NSString *)description
@@ -397,11 +475,11 @@
 
     _delegate = aDelegate;
 
-    _delegateHasBeforeMapMove = [_delegate respondsToSelector:@selector(beforeMapMove:)];
-    _delegateHasAfterMapMove  = [_delegate respondsToSelector:@selector(afterMapMove:)];
+    _delegateHasBeforeMapMove = [_delegate respondsToSelector:@selector(beforeMapMove:byUser:)];
+    _delegateHasAfterMapMove  = [_delegate respondsToSelector:@selector(afterMapMove:byUser:)];
 
-    _delegateHasBeforeMapZoom = [_delegate respondsToSelector:@selector(beforeMapZoom:)];
-    _delegateHasAfterMapZoom  = [_delegate respondsToSelector:@selector(afterMapZoom:)];
+    _delegateHasBeforeMapZoom = [_delegate respondsToSelector:@selector(beforeMapZoom:byUser:)];
+    _delegateHasAfterMapZoom  = [_delegate respondsToSelector:@selector(afterMapZoom:byUser:)];
 
     _delegateHasMapViewRegionDidChange = [_delegate respondsToSelector:@selector(mapViewRegionDidChange:)];
 
@@ -428,6 +506,68 @@
     _delegateHasDidUpdateUserLocation = [_delegate respondsToSelector:@selector(mapView:didUpdateUserLocation:)];
     _delegateHasDidFailToLocateUserWithError = [_delegate respondsToSelector:@selector(mapView:didFailToLocateUserWithError:)];
     _delegateHasDidChangeUserTrackingMode = [_delegate respondsToSelector:@selector(mapView:didChangeUserTrackingMode:animated:)];
+}
+
+- (void)registerMoveEventByUser:(BOOL)wasUserEvent
+{
+    @synchronized (_moveDelegateQueue)
+    {
+        BOOL flag = wasUserEvent;
+
+        if ([_moveDelegateQueue operationCount] == 0)
+        {
+            dispatch_async(dispatch_get_main_queue(), ^(void)
+            {
+                if (_delegateHasBeforeMapMove)
+                    [_delegate beforeMapMove:self byUser:flag];
+            });
+        }
+
+        [_moveDelegateQueue setSuspended:YES];
+
+        if ([_moveDelegateQueue operationCount] == 0)
+        {
+            [_moveDelegateQueue addOperationWithBlock:^(void)
+            {
+                dispatch_async(dispatch_get_main_queue(), ^(void)
+                {
+                    if (_delegateHasAfterMapMove)
+                        [_delegate afterMapMove:self byUser:flag];
+                });
+            }];
+        }
+    }
+}
+
+- (void)registerZoomEventByUser:(BOOL)wasUserEvent
+{
+    @synchronized (_zoomDelegateQueue)
+    {
+        BOOL flag = wasUserEvent;
+
+        if ([_zoomDelegateQueue operationCount] == 0)
+        {
+            dispatch_async(dispatch_get_main_queue(), ^(void)
+            {
+                if (_delegateHasBeforeMapZoom)
+                    [_delegate beforeMapZoom:self byUser:flag];
+            });
+        }
+
+        [_zoomDelegateQueue setSuspended:YES];
+
+        if ([_zoomDelegateQueue operationCount] == 0)
+        {
+            [_zoomDelegateQueue addOperationWithBlock:^(void)
+            {
+                dispatch_async(dispatch_get_main_queue(), ^(void)
+                {
+                    if (_delegateHasAfterMapZoom)
+                        [_delegate afterMapZoom:self byUser:flag];
+                });
+            }];
+        }
+    }
 }
 
 #pragma mark -
@@ -459,8 +599,6 @@
 
 - (RMProjectedRect)projectedRectFromLatitudeLongitudeBounds:(RMSphericalTrapezium)bounds
 {
-    float pixelBuffer = kZoomRectPixelBuffer;
-
     CLLocationCoordinate2D southWest = bounds.southWest;
     CLLocationCoordinate2D northEast = bounds.northEast;
     CLLocationCoordinate2D midpoint = {
@@ -485,18 +623,18 @@
 
     if ((myPoint.x / self.bounds.size.width) < (myPoint.y / self.bounds.size.height))
     {
-        if ((myPoint.y / (self.bounds.size.height - pixelBuffer)) > 1)
+        if ((myPoint.y / self.bounds.size.height) > 1)
         {
-            zoomRect.size.width = self.bounds.size.width * (myPoint.y / (self.bounds.size.height - pixelBuffer));
-            zoomRect.size.height = self.bounds.size.height * (myPoint.y / (self.bounds.size.height - pixelBuffer));
+            zoomRect.size.width = self.bounds.size.width * (myPoint.y / self.bounds.size.height);
+            zoomRect.size.height = self.bounds.size.height * (myPoint.y / self.bounds.size.height);
         }
     }
     else
     {
-        if ((myPoint.x / (self.bounds.size.width - pixelBuffer)) > 1)
+        if ((myPoint.x / self.bounds.size.width) > 1)
         {
-            zoomRect.size.width = self.bounds.size.width * (myPoint.x / (self.bounds.size.width - pixelBuffer));
-            zoomRect.size.height = self.bounds.size.height * (myPoint.x / (self.bounds.size.width - pixelBuffer));
+            zoomRect.size.width = self.bounds.size.width * (myPoint.x / self.bounds.size.width);
+            zoomRect.size.height = self.bounds.size.height * (myPoint.x / self.bounds.size.width);
         }
     }
 
@@ -589,8 +727,7 @@
 
 - (void)setCenterProjectedPoint:(RMProjectedPoint)centerProjectedPoint animated:(BOOL)animated
 {
-    if (_delegateHasBeforeMapMove)
-        [_delegate beforeMapMove:self];
+    [self registerMoveEventByUser:NO];
 
 //    RMLog(@"Current contentSize: {%.0f,%.0f}, zoom: %f", mapScrollView.contentSize.width, mapScrollView.contentSize.height, self.zoom);
 
@@ -605,8 +742,8 @@
 
 //    RMLog(@"setMapCenterProjectedPoint: {%f,%f} -> {%.0f,%.0f}", centerProjectedPoint.x, centerProjectedPoint.y, mapScrollView.contentOffset.x, mapScrollView.contentOffset.y);
 
-    if (_delegateHasAfterMapMove && !animated)
-        [_delegate afterMapMove:self];
+    if ( ! animated)
+        [_moveDelegateQueue setSuspended:NO];
 
     [self correctPositionOfAllAnnotations];
 }
@@ -615,16 +752,14 @@
 
 - (void)moveBy:(CGSize)delta
 {
-    if (_delegateHasBeforeMapMove)
-        [_delegate beforeMapMove:self];
+    [self registerMoveEventByUser:NO];
 
     CGPoint contentOffset = _mapScrollView.contentOffset;
     contentOffset.x += delta.width;
     contentOffset.y += delta.height;
     _mapScrollView.contentOffset = contentOffset;
 
-    if (_delegateHasAfterMapMove)
-        [_delegate afterMapMove:self];
+    [_moveDelegateQueue setSuspended:NO];
 }
 
 #pragma mark -
@@ -821,7 +956,7 @@
 
 - (void)zoomInToNextNativeZoomAt:(CGPoint)pivot animated:(BOOL)animated
 {
-    if (self.userTrackingMode != RMUserTrackingModeNone && ! CGPointEqualToPoint(pivot, self.center))
+    if (self.userTrackingMode != RMUserTrackingModeNone && ! CGPointEqualToPoint(pivot, [self coordinateToPixel:self.userLocation.location.coordinate]))
         self.userTrackingMode = RMUserTrackingModeNone;
     
     // Calculate rounded zoom
@@ -889,8 +1024,6 @@
     else
     {
         // Convert northEast/southWest into RMMercatorRect and call zoomWithBounds
-        float pixelBuffer = kZoomRectPixelBuffer;
-
         CLLocationCoordinate2D midpoint = {
             .latitude = (northEast.latitude + southWest.latitude) / 2,
             .longitude = (northEast.longitude + southWest.longitude) / 2
@@ -913,27 +1046,24 @@
 
         if ((myPoint.x / self.bounds.size.width) < (myPoint.y / self.bounds.size.height))
         {
-            if ((myPoint.y / (self.bounds.size.height - pixelBuffer)) > 1)
+            if ((myPoint.y / self.bounds.size.height) > 1)
             {
-                zoomRect.size.width = self.bounds.size.width * (myPoint.y / (self.bounds.size.height - pixelBuffer));
-                zoomRect.size.height = self.bounds.size.height * (myPoint.y / (self.bounds.size.height - pixelBuffer));
+                zoomRect.size.width = self.bounds.size.width * (myPoint.y / self.bounds.size.height);
+                zoomRect.size.height = self.bounds.size.height * (myPoint.y / self.bounds.size.height);
             }
         }
         else
         {
-            if ((myPoint.x / (self.bounds.size.width - pixelBuffer)) > 1)
+            if ((myPoint.x / self.bounds.size.width) > 1)
             {
-                zoomRect.size.width = self.bounds.size.width * (myPoint.x / (self.bounds.size.width - pixelBuffer));
-                zoomRect.size.height = self.bounds.size.height * (myPoint.x / (self.bounds.size.width - pixelBuffer));
+                zoomRect.size.width = self.bounds.size.width * (myPoint.x / self.bounds.size.width);
+                zoomRect.size.height = self.bounds.size.height * (myPoint.x / self.bounds.size.width);
             }
         }
 
         myOrigin.x = myOrigin.x - (zoomRect.size.width / 2);
         myOrigin.y = myOrigin.y - (zoomRect.size.height / 2);
         zoomRect.origin = myOrigin;
-
-        RMProjectedPoint topRight = RMProjectedPointMake(myOrigin.x + zoomRect.size.width, myOrigin.y + zoomRect.size.height);
-        RMLog(@"zoomWithBoundingBox: {%f,%f} - {%f,%f}", [_projection projectedPointToCoordinate:myOrigin].longitude, [_projection projectedPointToCoordinate:myOrigin].latitude, [_projection projectedPointToCoordinate:topRight].longitude, [_projection projectedPointToCoordinate:topRight].latitude);
 
         [self setProjectedBounds:zoomRect animated:animated];
     }
@@ -1044,16 +1174,10 @@
     [self addGestureRecognizer:longPressRecognizer];
 
     // two finger taps
-    UITapGestureRecognizer *twoFingerDoubleTapRecognizer = [[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTwoFingerDoubleTap:)] autorelease];
-    twoFingerDoubleTapRecognizer.numberOfTapsRequired = 2;
-    twoFingerDoubleTapRecognizer.numberOfTouchesRequired = 2;
-
     UITapGestureRecognizer *twoFingerSingleTapRecognizer = [[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTwoFingerSingleTap:)] autorelease];
     twoFingerSingleTapRecognizer.numberOfTouchesRequired = 2;
-    [twoFingerSingleTapRecognizer requireGestureRecognizerToFail:twoFingerDoubleTapRecognizer];
 
     [self addGestureRecognizer:twoFingerSingleTapRecognizer];
-    [self addGestureRecognizer:twoFingerDoubleTapRecognizer];
 
     // pan
     UIPanGestureRecognizer *panGestureRecognizer = [[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanGesture:)] autorelease];
@@ -1079,17 +1203,16 @@
 
 - (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView
 {
+    [self registerMoveEventByUser:YES];
+
     if (self.userTrackingMode != RMUserTrackingModeNone)
         self.userTrackingMode = RMUserTrackingModeNone;
-
-    if (_delegateHasBeforeMapMove)
-        [_delegate beforeMapMove:self];
 }
 
 - (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate
 {
-    if (!decelerate && _delegateHasAfterMapMove)
-        [_delegate afterMapMove:self];
+    if ( ! decelerate)
+        [_moveDelegateQueue setSuspended:NO];
 }
 
 - (void)scrollViewWillBeginDecelerating:(UIScrollView *)scrollView
@@ -1100,43 +1223,60 @@
 
 - (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView
 {
-    if (_delegateHasAfterMapMove)
-        [_delegate afterMapMove:self];
+    [_moveDelegateQueue setSuspended:NO];
 }
 
 - (void)scrollViewDidEndScrollingAnimation:(UIScrollView *)scrollView
 {
-    if (_delegateHasAfterMapMove)
-        [_delegate afterMapMove:self];
+    [_moveDelegateQueue setSuspended:NO];
 }
 
 - (void)scrollViewWillBeginZooming:(UIScrollView *)scrollView withView:(UIView *)view
 {
+    [self registerZoomEventByUser:(scrollView.pinchGestureRecognizer.state == UIGestureRecognizerStateBegan)];
+
     _mapScrollViewIsZooming = YES;
 
-    if (_delegateHasBeforeMapZoom)
-        [_delegate beforeMapZoom:self];
+    if (_loadingTileView)
+        _loadingTileView.mapZooming = YES;
 }
 
 - (void)scrollViewDidEndZooming:(UIScrollView *)scrollView withView:(UIView *)view atScale:(float)scale
 {
+    [_moveDelegateQueue setSuspended:NO];
+    [_zoomDelegateQueue setSuspended:NO];
+
     _mapScrollViewIsZooming = NO;
 
     [self correctPositionOfAllAnnotations];
+
+    if (_loadingTileView)
+        _loadingTileView.mapZooming = NO;
+}
+
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView
+{
+    if (_loadingTileView)
+    {
+        CGSize delta = CGSizeMake(scrollView.contentOffset.x - _lastContentOffset.x, scrollView.contentOffset.y - _lastContentOffset.y);
+        CGPoint newOffset = CGPointMake(_loadingTileView.contentOffset.x + delta.width, _loadingTileView.contentOffset.y + delta.height);
+        _loadingTileView.contentOffset = newOffset;
+    }
 }
 
 - (void)scrollViewDidZoom:(UIScrollView *)scrollView
 {
-    if (self.userTrackingMode != RMUserTrackingModeNone && scrollView.pinchGestureRecognizer.state == UIGestureRecognizerStateChanged)
+    BOOL wasUserAction = (scrollView.pinchGestureRecognizer.state == UIGestureRecognizerStateChanged);
+
+    [self registerZoomEventByUser:wasUserAction];
+
+    if (self.userTrackingMode != RMUserTrackingModeNone && wasUserAction)
         self.userTrackingMode = RMUserTrackingModeNone;
     
     [self correctPositionOfAllAnnotations];
 
     if (_zoom < 3 && self.userTrackingMode == RMUserTrackingModeFollowWithHeading)
         self.userTrackingMode = RMUserTrackingModeFollow;
-
-    if (_delegateHasAfterMapZoom)
-        [_delegate afterMapZoom:self];
 }
 
 // Detect dragging/zooming
@@ -1273,7 +1413,6 @@
     _lastContentOffset = _mapScrollView.contentOffset;
     _lastContentSize = _mapScrollView.contentSize;
 
-    // Don't do anything stupid here or your scrolling experience will suck
     if (_delegateHasMapViewRegionDidChange)
         [_delegate mapViewRegionDidChange:self];
 }
@@ -1303,7 +1442,7 @@
 
 - (void)handleSingleTap:(UIGestureRecognizer *)recognizer
 {
-    CALayer *hit = [_overlayView.layer hitTest:[recognizer locationInView:_overlayView]];
+    CALayer *hit = [_overlayView overlayHitTest:[recognizer locationInView:self]];
 
     if ( ! hit)
     {
@@ -1334,10 +1473,22 @@
 
 - (void)doubleTapAtPoint:(CGPoint)aPoint
 {
+    [self registerZoomEventByUser:YES];
+
     if (self.zoomingInPivotsAroundCenter)
+    {
         [self zoomInToNextNativeZoomAt:[self convertPoint:self.center fromView:self.superview] animated:YES];
+    }
+    else if (self.userTrackingMode != RMUserTrackingModeNone && fabsf(aPoint.x - [self coordinateToPixel:self.userLocation.location.coordinate].x) < 75 && fabsf(aPoint.y - [self coordinateToPixel:self.userLocation.location.coordinate].y) < 75)
+    {
+        [self zoomInToNextNativeZoomAt:[self coordinateToPixel:self.userLocation.location.coordinate] animated:YES];
+    }
     else
+    {
+        [self registerMoveEventByUser:YES];
+
         [self zoomInToNextNativeZoomAt:aPoint animated:YES];
+    }
 
     if (_delegateHasDoubleTapOnMap)
         [_delegate doubleTapOnMap:self at:aPoint];
@@ -1345,7 +1496,7 @@
 
 - (void)handleDoubleTap:(UIGestureRecognizer *)recognizer
 {
-    CALayer *hit = [_overlayView.layer hitTest:[recognizer locationInView:_overlayView]];
+    CALayer *hit = [_overlayView overlayHitTest:[recognizer locationInView:self]];
 
     if ( ! hit)
     {
@@ -1374,17 +1525,16 @@
     }
 }
 
-- (void)handleTwoFingerDoubleTap:(UIGestureRecognizer *)recognizer
-{
-    [self zoomOutToNextNativeZoomAt:[self convertPoint:self.center fromView:self.superview] animated:YES];
-
-    if (_delegateHasDoubleTapTwoFingersOnMap)
-        [_delegate doubleTapTwoFingersOnMap:self at:[recognizer locationInView:self]];
-}
-
 - (void)handleTwoFingerSingleTap:(UIGestureRecognizer *)recognizer
 {
-    [self zoomOutToNextNativeZoomAt:[self convertPoint:self.center fromView:self.superview] animated:YES];
+    [self registerZoomEventByUser:YES];
+
+    CGPoint centerPoint = [self convertPoint:self.center fromView:self.superview];
+
+    if (self.userTrackingMode != RMUserTrackingModeNone)
+        centerPoint = [self coordinateToPixel:self.userLocation.location.coordinate];
+
+    [self zoomOutToNextNativeZoomAt:centerPoint animated:YES];
 
     if (_delegateHasSingleTapTwoFingersOnMap)
         [_delegate singleTapTwoFingersOnMap:self at:[recognizer locationInView:self]];
@@ -1405,8 +1555,11 @@
     if ([recognizer isKindOfClass:[UIPanGestureRecognizer class]])
     {
         // check whether our custom pan gesture recognizer should start recognizing the gesture
-        CALayer *hit = [_overlayView.layer hitTest:[recognizer locationInView:_overlayView]];
+        CALayer *hit = [_overlayView overlayHitTest:[recognizer locationInView:_overlayView]];
 
+        if ([hit isEqual:_overlayView.layer])
+            return NO;
+        
         if (!hit || ([hit respondsToSelector:@selector(enableDragging)] && ![(RMMarker *)hit enableDragging]))
             return NO;
 
@@ -1997,6 +2150,26 @@
     }
 }
 
+- (void)setShowLogoBug:(BOOL)showLogoBug
+{
+    if (showLogoBug && ! _logoBug)
+    {
+        _logoBug = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"mapbox.png"]];
+
+        _logoBug.frame = CGRectMake(8, self.bounds.size.height - _logoBug.bounds.size.height - 4, _logoBug.bounds.size.width, _logoBug.bounds.size.height);
+        _logoBug.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleRightMargin;
+
+        [self addSubview:_logoBug];
+    }
+    else if ( ! showLogoBug && _logoBug)
+    {
+        [_logoBug removeFromSuperview];
+        [_logoBug release]; _logoBug = nil;
+    }
+
+    _showLogoBug = showLogoBug;
+}
+
 #pragma mark -
 #pragma mark LatLng/Pixel translation functions
 
@@ -2252,6 +2425,9 @@
             if (annotation.layer == nil)
                 continue;
 
+            if ([annotation.layer isKindOfClass:[RMMarker class]] && ! annotation.isUserLocationAnnotation)
+                annotation.layer.transform = _annotationTransform;
+
             // Use the zPosition property to order the layer hierarchy
             if ( ! [_visibleAnnotations containsObject:annotation])
             {
@@ -2303,6 +2479,9 @@
                         if (annotation.layer == nil)
                             continue;
 
+                        if ([annotation.layer isKindOfClass:[RMMarker class]] && ! annotation.isUserLocationAnnotation)
+                            annotation.layer.transform = _annotationTransform;
+
                         if (![_visibleAnnotations containsObject:annotation])
                         {
                             if (!lastLayer)
@@ -2341,6 +2520,36 @@
             }
         }
     }
+
+    NSMutableArray *sortedAnnotations = [NSMutableArray arrayWithArray:[_visibleAnnotations allObjects]];
+
+    [sortedAnnotations filterUsingPredicate:[NSPredicate predicateWithFormat:@"isUserLocationAnnotation = NO"]];
+
+    [sortedAnnotations sortUsingComparator:^(id obj1, id obj2)
+    {
+        RMAnnotation *annotation1 = (RMAnnotation *)obj1;
+        RMAnnotation *annotation2 = (RMAnnotation *)obj2;
+
+        if (   [annotation1.annotationType isEqualToString:kRMClusterAnnotationTypeName] && ! [annotation2.annotationType isEqualToString:kRMClusterAnnotationTypeName])
+            return (_orderClusterMarkersOnTop ? NSOrderedDescending : NSOrderedAscending);
+
+        if ( ! [annotation1.annotationType isEqualToString:kRMClusterAnnotationTypeName] &&   [annotation2.annotationType isEqualToString:kRMClusterAnnotationTypeName])
+            return (_orderClusterMarkersOnTop ? NSOrderedAscending : NSOrderedDescending);
+
+        CGPoint obj1Point = [self convertPoint:annotation1.position fromView:_overlayView];
+        CGPoint obj2Point = [self convertPoint:annotation2.position fromView:_overlayView];
+
+        if (obj1Point.y > obj2Point.y)
+            return NSOrderedDescending;
+
+        if (obj1Point.y < obj2Point.y)
+            return NSOrderedAscending;
+
+        return NSOrderedSame;
+    }];
+
+    for (CGFloat i = 0; i < [sortedAnnotations count]; i++)
+        ((RMAnnotation *)[sortedAnnotations objectAtIndex:i]).layer.zPosition = (CGFloat)i;
 
     [CATransaction commit];
 }
@@ -2447,72 +2656,81 @@
 
 - (void)setShowsUserLocation:(BOOL)newShowsUserLocation
 {
-    if (newShowsUserLocation == showsUserLocation)
+    if (newShowsUserLocation == _showsUserLocation)
         return;
-    
-    showsUserLocation = newShowsUserLocation;
-    
+
+    _showsUserLocation = newShowsUserLocation;
+
     if (newShowsUserLocation)
     {
+        RMRequireAsset(@"HeadingAngleSmall.png");
+        RMRequireAsset(@"TrackingDot.png");
+        RMRequireAsset(@"TrackingDotHalo.png");
+        RMRequireAsset(@"TrackingHeading.png");
+        RMRequireAsset(@"TrackingLocation.png");
+
         if (_delegateHasWillStartLocatingUser)
             [_delegate mapViewWillStartLocatingUser:self];
-        
-        self.userLocation = [RMUserLocation annotationWithMapView:self coordinate:CLLocationCoordinate2DMake(0, 0) andTitle:nil];
-        
-        locationManager = [[CLLocationManager alloc] init];
-        locationManager.headingFilter = 5;
-        locationManager.delegate = self;
-        [locationManager startUpdatingLocation];
+
+        self.userLocation = [RMUserLocation annotationWithMapView:self coordinate:CLLocationCoordinate2DMake(MAXFLOAT, MAXFLOAT) andTitle:nil];
+
+        _locationManager = [[CLLocationManager alloc] init];
+        _locationManager.headingFilter = 5.0;
+        _locationManager.delegate = self;
+        [_locationManager startUpdatingLocation];
     }
     else
     {
-        [locationManager stopUpdatingLocation];
-        [locationManager stopUpdatingHeading];
-        locationManager.delegate = nil;
-        [locationManager release];
-        locationManager = nil;
-        
+        [_locationManager stopUpdatingLocation];
+        [_locationManager stopUpdatingHeading];
+        _locationManager.delegate = nil;
+        [_locationManager release]; _locationManager = nil;
+
         if (_delegateHasDidStopLocatingUser)
             [_delegate mapViewDidStopLocatingUser:self];
-        
+
         [self setUserTrackingMode:RMUserTrackingModeNone animated:YES];
-        
+
         NSMutableArray *annotationsToRemove = [NSMutableArray array];
-        
+
         for (RMAnnotation *annotation in _annotations)
+        {
             if (annotation.isUserLocationAnnotation)
                 [annotationsToRemove addObject:annotation];
-        
+        }
+
         for (RMAnnotation *annotationToRemove in annotationsToRemove)
+        {
             [self removeAnnotation:annotationToRemove];
-        
+        }
+
         self.userLocation = nil;
     }    
 }
 
 - (void)setUserLocation:(RMUserLocation *)newUserLocation
 {
-    if ( ! [newUserLocation isEqual:userLocation])
+    if ( ! [newUserLocation isEqual:_userLocation])
     {
-        [userLocation release];
-        userLocation = [newUserLocation retain];
+        [_userLocation release];
+        _userLocation = [newUserLocation retain];
     }
 }
 
 - (BOOL)isUserLocationVisible
 {
-    if (userLocation)
+    if (self.userLocation)
     {
-        CGPoint locationPoint = [self mapPositionForAnnotation:userLocation];
-        
-        CGRect locationRect = CGRectMake(locationPoint.x - userLocation.location.horizontalAccuracy,
-                                         locationPoint.y - userLocation.location.horizontalAccuracy,
-                                         userLocation.location.horizontalAccuracy * 2,
-                                         userLocation.location.horizontalAccuracy * 2);
-        
+        CGPoint locationPoint = [self mapPositionForAnnotation:self.userLocation];
+
+        CGRect locationRect = CGRectMake(locationPoint.x - self.userLocation.location.horizontalAccuracy,
+                                         locationPoint.y - self.userLocation.location.horizontalAccuracy,
+                                         self.userLocation.location.horizontalAccuracy * 2,
+                                         self.userLocation.location.horizontalAccuracy * 2);
+
         return CGRectIntersectsRect([self bounds], locationRect);
     }
-    
+
     return NO;
 }
 
@@ -2523,310 +2741,409 @@
 
 - (void)setUserTrackingMode:(RMUserTrackingMode)mode animated:(BOOL)animated
 {
-    if (mode == userTrackingMode)
+    if (mode == _userTrackingMode)
         return;
-    
-    userTrackingMode = mode;
-    
-    switch (userTrackingMode)
+
+    if (mode == RMUserTrackingModeFollowWithHeading && ! CLLocationCoordinate2DIsValid(self.userLocation.coordinate))
+        mode = RMUserTrackingModeNone;
+
+    _userTrackingMode = mode;
+
+    switch (_userTrackingMode)
     {
         case RMUserTrackingModeNone:
         default:
         {
-            [locationManager stopUpdatingHeading];
+            [_locationManager stopUpdatingHeading];
+
+            [CATransaction setAnimationDuration:0.5];
+            [CATransaction setAnimationTimingFunction:[CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut]];
 
             [UIView animateWithDuration:(animated ? 0.5 : 0.0)
                                   delay:0.0
                                 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationCurveEaseInOut
                              animations:^(void)
                              {
-                                 _mapScrollView.transform = CGAffineTransformIdentity;
-                                 _overlayView.transform   = CGAffineTransformIdentity;
-                                 
+                                 _mapTransform = CGAffineTransformIdentity;
+                                 _annotationTransform = CATransform3DIdentity;
+
+                                 _mapScrollView.transform = _mapTransform;
+                                 _overlayView.transform   = _mapTransform;
+
                                  for (RMAnnotation *annotation in _annotations)
-                                     if ( ! annotation.isUserLocationAnnotation)
-                                         annotation.layer.transform = CATransform3DIdentity;
+                                     if ([annotation.layer isKindOfClass:[RMMarker class]] && ! annotation.isUserLocationAnnotation)
+                                         annotation.layer.transform = _annotationTransform;
                              }
                              completion:nil];
 
-            if (userLocationTrackingView || userHeadingTrackingView)
+            [CATransaction commit];
+
+            if (_userLocationTrackingView || _userHeadingTrackingView || _userHaloTrackingView)
             {
-                [userLocationTrackingView removeFromSuperview];
-                userLocationTrackingView = nil;
-                [userHeadingTrackingView removeFromSuperview];
-                userHeadingTrackingView = nil;
+                [_userLocationTrackingView removeFromSuperview]; _userLocationTrackingView = nil;
+                [_userHeadingTrackingView removeFromSuperview]; _userHeadingTrackingView = nil;
+                [_userHaloTrackingView removeFromSuperview]; _userHaloTrackingView = nil;
             }
-            
-            userLocation.layer.hidden = NO;
-            
+
+            self.userLocation.layer.hidden = NO;
+
             break;
         }
         case RMUserTrackingModeFollow:
         {
             self.showsUserLocation = YES;
-            
-            [locationManager stopUpdatingHeading];
+
+            [_locationManager stopUpdatingHeading];
 
             if (self.userLocation)
-                [self locationManager:locationManager didUpdateToLocation:self.userLocation.location fromLocation:self.userLocation.location];
+                [self locationManager:_locationManager didUpdateToLocation:self.userLocation.location fromLocation:self.userLocation.location];
 
-            if (userLocationTrackingView || userHeadingTrackingView)
+            if (_userLocationTrackingView || _userHeadingTrackingView || _userHaloTrackingView)
             {
-                [userLocationTrackingView removeFromSuperview];
-                userLocationTrackingView = nil;
-                [userHeadingTrackingView removeFromSuperview];
-                userHeadingTrackingView = nil;
+                [_userLocationTrackingView removeFromSuperview]; _userLocationTrackingView = nil;
+                [_userHeadingTrackingView removeFromSuperview]; _userHeadingTrackingView = nil;
+                [_userHaloTrackingView removeFromSuperview]; _userHaloTrackingView = nil;
             }
-            
+
+            [CATransaction setAnimationDuration:0.5];
+            [CATransaction setAnimationTimingFunction:[CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut]];
+
             [UIView animateWithDuration:(animated ? 0.5 : 0.0)
                                   delay:0.0
                                 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationCurveEaseInOut
                              animations:^(void)
                              {
-                                 _mapScrollView.transform = CGAffineTransformIdentity;
-                                 _overlayView.transform   = CGAffineTransformIdentity;
-                                 
+                                 _mapTransform = CGAffineTransformIdentity;
+                                 _annotationTransform = CATransform3DIdentity;
+
+                                 _mapScrollView.transform = _mapTransform;
+                                 _overlayView.transform   = _mapTransform;
+
                                  for (RMAnnotation *annotation in _annotations)
-                                     if ( ! annotation.isUserLocationAnnotation)
-                                         annotation.layer.transform = CATransform3DIdentity;
+                                     if ([annotation.layer isKindOfClass:[RMMarker class]] && ! annotation.isUserLocationAnnotation)
+                                         annotation.layer.transform = _annotationTransform;
                              }
                              completion:nil];
-            
-            userLocation.layer.hidden = NO;
-            
+
+            [CATransaction commit];
+
+            self.userLocation.layer.hidden = NO;
+
             break;
         }
         case RMUserTrackingModeFollowWithHeading:
         {
             self.showsUserLocation = YES;
-            
-            userLocation.layer.hidden = YES;
-            
-            userHeadingTrackingView = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"HeadingAngleSmall.png"]];
-            
-            userHeadingTrackingView.center = CGPointMake(round([self bounds].size.width  / 2), 
-                                                         round([self bounds].size.height / 2) - (userHeadingTrackingView.bounds.size.height / 2) - 4);
-            
-            userHeadingTrackingView.alpha = 0.0;
-            
-            [self addSubview:userHeadingTrackingView];
-            
-            [UIView animateWithDuration:0.5 animations:^(void) { userHeadingTrackingView.alpha = 1.0; }];
-            
-            userLocationTrackingView = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"TrackingDot.png"]];
-            
-            userLocationTrackingView.center = CGPointMake(round([self bounds].size.width  / 2), 
+
+            self.userLocation.layer.hidden = YES;
+
+            _userHaloTrackingView = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"TrackingDotHalo"]];
+
+            _userHaloTrackingView.center = CGPointMake(round([self bounds].size.width  / 2),
+                                                      round([self bounds].size.height / 2));
+
+            _userHaloTrackingView.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin  |
+                                                    UIViewAutoresizingFlexibleRightMargin |
+                                                    UIViewAutoresizingFlexibleTopMargin   |
+                                                    UIViewAutoresizingFlexibleBottomMargin;
+
+            for (NSString *animationKey in _trackingHaloAnnotation.layer.animationKeys)
+                [_userHaloTrackingView.layer addAnimation:[[[_trackingHaloAnnotation.layer animationForKey:animationKey] copy] autorelease] forKey:animationKey];
+
+            [self insertSubview:_userHaloTrackingView belowSubview:_overlayView];
+
+            _userHeadingTrackingView = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"HeadingAngleSmall.png"]];
+
+            _userHeadingTrackingView.frame = CGRectMake((self.bounds.size.width  / 2) - (_userHeadingTrackingView.bounds.size.width / 2),
+                                                       (self.bounds.size.height / 2) - _userHeadingTrackingView.bounds.size.height,
+                                                       _userHeadingTrackingView.bounds.size.width,
+                                                       _userHeadingTrackingView.bounds.size.height * 2);
+
+            _userHeadingTrackingView.contentMode = UIViewContentModeTop;
+
+            _userHeadingTrackingView.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin  |
+                                                       UIViewAutoresizingFlexibleRightMargin |
+                                                       UIViewAutoresizingFlexibleTopMargin   |
+                                                       UIViewAutoresizingFlexibleBottomMargin;
+
+            _userHeadingTrackingView.alpha = 0.0;
+
+            [self insertSubview:_userHeadingTrackingView belowSubview:_overlayView];
+
+            _userLocationTrackingView = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"TrackingDot.png"]];
+
+            _userLocationTrackingView.center = CGPointMake(round([self bounds].size.width  / 2), 
                                                           round([self bounds].size.height / 2));
+
+            _userLocationTrackingView.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin  |
+                                                        UIViewAutoresizingFlexibleRightMargin |
+                                                        UIViewAutoresizingFlexibleTopMargin   |
+                                                        UIViewAutoresizingFlexibleBottomMargin;
             
-            [self addSubview:userLocationTrackingView];
-            
+            [self insertSubview:_userLocationTrackingView aboveSubview:_userHeadingTrackingView];
+
             if (self.zoom < 3)
                 [self zoomByFactor:exp2f(3 - [self zoom]) near:self.center animated:YES];
 
             if (self.userLocation)
-                [self locationManager:locationManager didUpdateToLocation:self.userLocation.location fromLocation:self.userLocation.location];
+                [self locationManager:_locationManager didUpdateToLocation:self.userLocation.location fromLocation:self.userLocation.location];
 
-            [locationManager startUpdatingHeading];
-            
+            [self updateHeadingForDeviceOrientation];
+
+            [_locationManager startUpdatingHeading];
+
             break;
         }
     }
 
     if (_delegateHasDidChangeUserTrackingMode)
-        [_delegate mapView:self didChangeUserTrackingMode:userTrackingMode animated:animated];
+        [_delegate mapView:self didChangeUserTrackingMode:_userTrackingMode animated:animated];
 }
 
 - (void)locationManager:(CLLocationManager *)manager didUpdateToLocation:(CLLocation *)newLocation fromLocation:(CLLocation *)oldLocation
 {
-    if ( ! showsUserLocation || _mapScrollView.isDragging)
+    if ( ! _showsUserLocation || _mapScrollView.isDragging || ! newLocation || ! CLLocationCoordinate2DIsValid(newLocation.coordinate))
         return;
-    
+
     if ([newLocation distanceFromLocation:oldLocation])
     {
-        userLocation.location = newLocation;
+        self.userLocation.location = newLocation;
 
         if (_delegateHasDidUpdateUserLocation)
-            [_delegate mapView:self didUpdateUserLocation:userLocation];
+            [_delegate mapView:self didUpdateUserLocation:self.userLocation];
     }
-    
+
     if (self.userTrackingMode != RMUserTrackingModeNone)
     {
-        // zoom centered on user location unless we're already centered there (or very close)
+        // center on user location unless we're already centered there (or very close)
         //
         CGPoint mapCenterPoint    = [self convertPoint:self.center fromView:self.superview];
-        CGPoint userLocationPoint = [self mapPositionForAnnotation:userLocation];
+        CGPoint userLocationPoint = [self mapPositionForAnnotation:self.userLocation];
 
-        if (fabsf(userLocationPoint.x - mapCenterPoint.x) > 2 || fabsf(userLocationPoint.y - mapCenterPoint.y > 2))
+        if (fabsf(userLocationPoint.x - mapCenterPoint.x) > 1.0 || fabsf(userLocationPoint.y - mapCenterPoint.y) > 1.0)
         {
-            float delta = newLocation.horizontalAccuracy / 110000; // approx. meter per degree latitude
-            
-            CLLocationCoordinate2D southWest = CLLocationCoordinate2DMake(newLocation.coordinate.latitude  - delta, 
-                                                                          newLocation.coordinate.longitude - delta);
-            
-            CLLocationCoordinate2D northEast = CLLocationCoordinate2DMake(newLocation.coordinate.latitude  + delta, 
-                                                                          newLocation.coordinate.longitude + delta);
+            if (round(_zoom) >= 10)
+            {
+                // at sufficient detail, just re-center the map; don't zoom
+                //
+                [self setCenterCoordinate:self.userLocation.location.coordinate animated:YES];
+            }
+            else
+            {
+                // otherwise re-center and zoom in to near accuracy confidence
+                //
+                float delta = (newLocation.horizontalAccuracy / 110000) * 1.2; // approx. meter per degree latitude, plus some margin
 
-            if (northEast.latitude  != [self latitudeLongitudeBoundingBox].northEast.latitude  ||
-                northEast.longitude != [self latitudeLongitudeBoundingBox].northEast.longitude ||
-                southWest.latitude  != [self latitudeLongitudeBoundingBox].southWest.latitude  ||
-                southWest.longitude != [self latitudeLongitudeBoundingBox].southWest.longitude)
-                [self zoomWithLatitudeLongitudeBoundsSouthWest:southWest northEast:northEast animated:YES];
+                CLLocationCoordinate2D desiredSouthWest = CLLocationCoordinate2DMake(newLocation.coordinate.latitude  - delta,
+                                                                                     newLocation.coordinate.longitude - delta);
+
+                CLLocationCoordinate2D desiredNorthEast = CLLocationCoordinate2DMake(newLocation.coordinate.latitude  + delta,
+                                                                                     newLocation.coordinate.longitude + delta);
+
+                CGFloat pixelRadius = fminf(self.bounds.size.width, self.bounds.size.height) / 2;
+
+                CLLocationCoordinate2D actualSouthWest = [self pixelToCoordinate:CGPointMake(userLocationPoint.x - pixelRadius, userLocationPoint.y - pixelRadius)];
+                CLLocationCoordinate2D actualNorthEast = [self pixelToCoordinate:CGPointMake(userLocationPoint.x + pixelRadius, userLocationPoint.y + pixelRadius)];
+
+                if (desiredNorthEast.latitude  != actualNorthEast.latitude  ||
+                    desiredNorthEast.longitude != actualNorthEast.longitude ||
+                    desiredSouthWest.latitude  != actualSouthWest.latitude  ||
+                    desiredSouthWest.longitude != actualSouthWest.longitude)
+                {
+                    [self zoomWithLatitudeLongitudeBoundsSouthWest:desiredSouthWest northEast:desiredNorthEast animated:YES];
+                }
+            }
         }
     }
 
-    RMAnnotation *accuracyCircleAnnotation = nil;
-    
-    for (RMAnnotation *annotation in _annotations)
-        if ([annotation.annotationType isEqualToString:kRMAccuracyCircleAnnotationTypeName])
-            accuracyCircleAnnotation = annotation;
-    
-    if ( ! accuracyCircleAnnotation)
+    if ( ! _accuracyCircleAnnotation)
     {
-        accuracyCircleAnnotation = [RMAnnotation annotationWithMapView:self coordinate:newLocation.coordinate andTitle:nil];
-        
-        accuracyCircleAnnotation.annotationType = kRMAccuracyCircleAnnotationTypeName;
-        
-        accuracyCircleAnnotation.clusteringEnabled = NO;
-        
-        accuracyCircleAnnotation.layer = [[RMCircle alloc] initWithView:self radiusInMeters:newLocation.horizontalAccuracy];
-        
-        accuracyCircleAnnotation.isUserLocationAnnotation = YES;
-        
-        ((RMCircle *)accuracyCircleAnnotation.layer).lineColor = [UIColor colorWithRed:0.378 green:0.552 blue:0.827 alpha:0.7];
-        ((RMCircle *)accuracyCircleAnnotation.layer).fillColor = [UIColor colorWithRed:0.378 green:0.552 blue:0.827 alpha:0.15];
-        
-        ((RMCircle *)accuracyCircleAnnotation.layer).lineWidthInPixels = 2.0;
-        
-        [self addAnnotation:accuracyCircleAnnotation];
-    }
-    
-    if ([newLocation distanceFromLocation:oldLocation])
-        accuracyCircleAnnotation.coordinate = newLocation.coordinate;
-    
-    if (newLocation.horizontalAccuracy != oldLocation.horizontalAccuracy)
-        ((RMCircle *)accuracyCircleAnnotation.layer).radiusInMeters = newLocation.horizontalAccuracy;
+        _accuracyCircleAnnotation = [[RMAnnotation annotationWithMapView:self coordinate:newLocation.coordinate andTitle:nil] retain];
+        _accuracyCircleAnnotation.annotationType = kRMAccuracyCircleAnnotationTypeName;
+        _accuracyCircleAnnotation.clusteringEnabled = NO;
+        _accuracyCircleAnnotation.layer = [[RMCircle alloc] initWithView:self radiusInMeters:newLocation.horizontalAccuracy];
+        _accuracyCircleAnnotation.layer.zPosition = -MAXFLOAT;
+        _accuracyCircleAnnotation.isUserLocationAnnotation = YES;
 
-    RMAnnotation *trackingHaloAnnotation = nil;
-    
-    for (RMAnnotation *annotation in _annotations)
-        if ([annotation.annotationType isEqualToString:kRMTrackingHaloAnnotationTypeName])
-            trackingHaloAnnotation = annotation;
-    
-    if ( ! trackingHaloAnnotation)
+        ((RMCircle *)_accuracyCircleAnnotation.layer).lineColor = [UIColor colorWithRed:0.378 green:0.552 blue:0.827 alpha:0.7];
+        ((RMCircle *)_accuracyCircleAnnotation.layer).fillColor = [UIColor colorWithRed:0.378 green:0.552 blue:0.827 alpha:0.15];
+
+        ((RMCircle *)_accuracyCircleAnnotation.layer).lineWidthInPixels = 2.0;
+
+        [self addAnnotation:_accuracyCircleAnnotation];
+    }
+
+    if ([newLocation distanceFromLocation:oldLocation])
+        _accuracyCircleAnnotation.coordinate = newLocation.coordinate;
+
+    if (newLocation.horizontalAccuracy != oldLocation.horizontalAccuracy)
+        ((RMCircle *)_accuracyCircleAnnotation.layer).radiusInMeters = newLocation.horizontalAccuracy;
+
+    if ( ! _trackingHaloAnnotation)
     {
-        trackingHaloAnnotation = [RMAnnotation annotationWithMapView:self coordinate:newLocation.coordinate andTitle:nil];
-        
-        trackingHaloAnnotation.annotationType = kRMTrackingHaloAnnotationTypeName;
-        
-        trackingHaloAnnotation.clusteringEnabled = NO;
-        
+        _trackingHaloAnnotation = [[RMAnnotation annotationWithMapView:self coordinate:newLocation.coordinate andTitle:nil] retain];
+        _trackingHaloAnnotation.annotationType = kRMTrackingHaloAnnotationTypeName;
+        _trackingHaloAnnotation.clusteringEnabled = NO;
+
         // create image marker
         //
-        trackingHaloAnnotation.layer = [[RMMarker alloc] initWithUIImage:[UIImage imageNamed:@"TrackingDotHalo.png"]];
-        
-        trackingHaloAnnotation.isUserLocationAnnotation = YES;
-        
+        _trackingHaloAnnotation.layer = [[RMMarker alloc] initWithUIImage:[UIImage imageNamed:@"TrackingDotHalo.png"]];
+        _trackingHaloAnnotation.layer.zPosition = -MAXFLOAT + 1;
+        _trackingHaloAnnotation.isUserLocationAnnotation = YES;
+
         [CATransaction begin];
         [CATransaction setAnimationDuration:2.5];
         [CATransaction setAnimationTimingFunction:[CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut]];
-        
+
         // scale out radially
         //
         CABasicAnimation *boundsAnimation = [CABasicAnimation animationWithKeyPath:@"transform"];
-        
         boundsAnimation.repeatCount = MAXFLOAT;
-        
         boundsAnimation.fromValue = [NSValue valueWithCATransform3D:CATransform3DMakeScale(0.1, 0.1, 1.0)];
         boundsAnimation.toValue   = [NSValue valueWithCATransform3D:CATransform3DMakeScale(2.0, 2.0, 1.0)];
-        
         boundsAnimation.removedOnCompletion = NO;
-        
         boundsAnimation.fillMode = kCAFillModeForwards;
-        
-        [trackingHaloAnnotation.layer addAnimation:boundsAnimation forKey:@"animateScale"];
-        
+
+        [_trackingHaloAnnotation.layer addAnimation:boundsAnimation forKey:@"animateScale"];
+
         // go transparent as scaled out
         //
         CABasicAnimation *opacityAnimation = [CABasicAnimation animationWithKeyPath:@"opacity"];
-        
         opacityAnimation.repeatCount = MAXFLOAT;
-        
         opacityAnimation.fromValue = [NSNumber numberWithFloat:1.0];
         opacityAnimation.toValue   = [NSNumber numberWithFloat:-1.0];
-        
         opacityAnimation.removedOnCompletion = NO;
-        
         opacityAnimation.fillMode = kCAFillModeForwards;
-        
-        [trackingHaloAnnotation.layer addAnimation:opacityAnimation forKey:@"animateOpacity"];
-        
-        [CATransaction commit];
-        
-        [self addAnnotation:trackingHaloAnnotation];
-    }
-    
-    if ([newLocation distanceFromLocation:oldLocation])
-        trackingHaloAnnotation.coordinate = newLocation.coordinate;
 
-    userLocation.layer.hidden = ((trackingHaloAnnotation.coordinate.latitude == 0 && trackingHaloAnnotation.coordinate.longitude == 0) || self.userTrackingMode == RMUserTrackingModeFollowWithHeading);
-    
-    accuracyCircleAnnotation.layer.hidden = newLocation.horizontalAccuracy <= 10;
-    
-    trackingHaloAnnotation.layer.hidden = ((trackingHaloAnnotation.coordinate.latitude == 0 && trackingHaloAnnotation.coordinate.longitude == 0) || newLocation.horizontalAccuracy > 10);
-    
-    if ( ! [_annotations containsObject:userLocation])
-        [self addAnnotation:userLocation];
+        [_trackingHaloAnnotation.layer addAnimation:opacityAnimation forKey:@"animateOpacity"];
+
+        [CATransaction commit];
+
+        [self addAnnotation:_trackingHaloAnnotation];
+    }
+
+    if ([newLocation distanceFromLocation:oldLocation])
+        _trackingHaloAnnotation.coordinate = newLocation.coordinate;
+
+    self.userLocation.layer.hidden = ( ! CLLocationCoordinate2DIsValid(self.userLocation.coordinate) || self.userTrackingMode == RMUserTrackingModeFollowWithHeading);
+
+    if (_userLocationTrackingView)
+        _userLocationTrackingView.hidden = ! CLLocationCoordinate2DIsValid(self.userLocation.coordinate);
+
+    _accuracyCircleAnnotation.layer.hidden = newLocation.horizontalAccuracy <= 10;
+
+    _trackingHaloAnnotation.layer.hidden = ( ! CLLocationCoordinate2DIsValid(self.userLocation.coordinate) || newLocation.horizontalAccuracy > 10 || self.userTrackingMode == RMUserTrackingModeFollowWithHeading);
+
+    if (_userHaloTrackingView)
+        _userHaloTrackingView.hidden = ( ! CLLocationCoordinate2DIsValid(self.userLocation.coordinate) || newLocation.horizontalAccuracy > 10);
+
+    if ( ! [_annotations containsObject:self.userLocation])
+        [self addAnnotation:self.userLocation];
 }
 
 - (BOOL)locationManagerShouldDisplayHeadingCalibration:(CLLocationManager *)manager
 {
-    return YES;
+    if (self.displayHeadingCalibration)
+        [_locationManager performSelector:@selector(dismissHeadingCalibrationDisplay) withObject:nil afterDelay:10.0];
+
+    return self.displayHeadingCalibration;
 }
 
 - (void)locationManager:(CLLocationManager *)manager didUpdateHeading:(CLHeading *)newHeading
 {
-    if ( ! showsUserLocation || _mapScrollView.isDragging)
+    if ( ! _showsUserLocation || _mapScrollView.isDragging || newHeading.headingAccuracy < 0)
         return;
-    
-    userLocation.heading = newHeading;
-    
+
+    self.userLocation.heading = newHeading;
+
     if (_delegateHasDidUpdateUserLocation)
-        [_delegate mapView:self didUpdateUserLocation:userLocation];
+        [_delegate mapView:self didUpdateUserLocation:self.userLocation];
 
     if (newHeading.trueHeading != 0 && self.userTrackingMode == RMUserTrackingModeFollowWithHeading)
     {
+        if (_userHeadingTrackingView.alpha < 1.0)
+            [UIView animateWithDuration:0.5 animations:^(void) { _userHeadingTrackingView.alpha = 1.0; }];
+
         [CATransaction begin];
-        [CATransaction setAnimationDuration:1.0];
+        [CATransaction setAnimationDuration:0.5];
         [CATransaction setAnimationTimingFunction:[CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut]];
-        
-        [UIView animateWithDuration:1.0
+
+        [UIView animateWithDuration:0.5
                               delay:0.0
                             options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationCurveEaseInOut
                          animations:^(void)
                          {
                              CGFloat angle = (M_PI / -180) * newHeading.trueHeading;
-                             
-                             _mapScrollView.transform = CGAffineTransformMakeRotation(angle);
-                             _overlayView.transform   = CGAffineTransformMakeRotation(angle);
-                             
+
+                             _mapTransform = CGAffineTransformMakeRotation(angle);
+                             _annotationTransform = CATransform3DMakeAffineTransform(CGAffineTransformMakeRotation(-angle));
+
+                             _mapScrollView.transform = _mapTransform;
+                             _overlayView.transform   = _mapTransform;
+
                              for (RMAnnotation *annotation in _annotations)
-                                 if ( ! annotation.isUserLocationAnnotation)
-                                     annotation.layer.transform = CATransform3DMakeAffineTransform(CGAffineTransformMakeRotation(-angle));
+                                 if ([annotation.layer isKindOfClass:[RMMarker class]] && ! annotation.isUserLocationAnnotation)
+                                     annotation.layer.transform = _annotationTransform;
+
+                             [self correctPositionOfAllAnnotations];
                          }
                          completion:nil];
-        
+
         [CATransaction commit];
+    }
+}
+
+- (void)locationManager:(CLLocationManager *)manager didChangeAuthorizationStatus:(CLAuthorizationStatus)status
+{
+    if (status == kCLAuthorizationStatusDenied || status == kCLAuthorizationStatusRestricted)
+    {
+        self.userTrackingMode  = RMUserTrackingModeNone;
+        self.showsUserLocation = NO;
     }
 }
 
 - (void)locationManager:(CLLocationManager *)manager didFailWithError:(NSError *)error
 {
-    if ([error code] != kCLErrorLocationUnknown)
+    if ([error code] == kCLErrorDenied)
     {
-        self.userTrackingMode = RMUserTrackingModeNone;
-        
+        self.userTrackingMode  = RMUserTrackingModeNone;
+        self.showsUserLocation = NO;
+
         if (_delegateHasDidFailToLocateUserWithError)
             [_delegate mapView:self didFailToLocateUserWithError:error];
+    }
+}
+
+- (void)updateHeadingForDeviceOrientation
+{
+    if (_locationManager)
+    {
+        // note that right/left device and interface orientations are opposites (see UIApplication.h)
+        //
+        switch ([[UIApplication sharedApplication] statusBarOrientation])
+        {
+            case (UIInterfaceOrientationLandscapeLeft):
+            {
+                _locationManager.headingOrientation = CLDeviceOrientationLandscapeRight;
+                break;
+            }
+            case (UIInterfaceOrientationLandscapeRight):
+            {
+                _locationManager.headingOrientation = CLDeviceOrientationLandscapeLeft;
+                break;
+            }
+            case (UIInterfaceOrientationPortraitUpsideDown):
+            {
+                _locationManager.headingOrientation = CLDeviceOrientationPortraitUpsideDown;
+                break;
+            }
+            case (UIInterfaceOrientationPortrait):
+            default:
+            {
+                _locationManager.headingOrientation = CLDeviceOrientationPortrait;
+                break;
+            }
+        }
     }
 }
 
@@ -2835,39 +3152,39 @@
 
 - (UIViewController *)viewControllerPresentingAttribution
 {
-    return viewControllerPresentingAttribution;
+    return _viewControllerPresentingAttribution;
 }
 
 - (void)setViewControllerPresentingAttribution:(UIViewController *)viewController
 {
-    viewControllerPresentingAttribution = viewController;
+    _viewControllerPresentingAttribution = viewController;
     
-    if (self.viewControllerPresentingAttribution && ! attributionButton)
+    if (_viewControllerPresentingAttribution && ! _attributionButton)
     {
-        attributionButton = [[UIButton buttonWithType:UIButtonTypeInfoLight] retain];
+        _attributionButton = [[UIButton buttonWithType:UIButtonTypeInfoLight] retain];
         
-        attributionButton.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleLeftMargin;
+        _attributionButton.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleLeftMargin;
         
-        [attributionButton addTarget:self action:@selector(showAttribution:) forControlEvents:UIControlEventTouchUpInside];
+        [_attributionButton addTarget:self action:@selector(showAttribution:) forControlEvents:UIControlEventTouchDown];
         
-        attributionButton.frame = CGRectMake(self.bounds.size.width  - 30, 
-                                             self.bounds.size.height - 30, 
-                                             attributionButton.bounds.size.width, 
-                                             attributionButton.bounds.size.height);
+        _attributionButton.frame = CGRectMake(self.bounds.size.width  - 30,
+                                              self.bounds.size.height - 30,
+                                              _attributionButton.bounds.size.width,
+                                              _attributionButton.bounds.size.height);
 
-        [self addSubview:attributionButton];
+        [self addSubview:_attributionButton];
     }
 }
 
 - (void)showAttribution:(id)sender
 {
-    if (self.viewControllerPresentingAttribution)
+    if (_viewControllerPresentingAttribution)
     {
-        RMAttributionViewController *attributionViewController = [[RMAttributionViewController alloc] initWithMapView:self];
+        RMAttributionViewController *attributionViewController = [[[RMAttributionViewController alloc] initWithMapView:self] autorelease];
         
         attributionViewController.modalTransitionStyle = UIModalTransitionStylePartialCurl;
         
-        [self.viewControllerPresentingAttribution presentModalViewController:attributionViewController animated:YES];
+        [_viewControllerPresentingAttribution presentModalViewController:attributionViewController animated:YES];
     }
 }
 

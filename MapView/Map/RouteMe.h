@@ -28,7 +28,6 @@
 // The list of header files for more convenient Route-Me import to projects.
 // (in alphabetic order)
 
-#import "NSUserDefaults+RouteMe.h"
 #import "RMAbstractMercatorTileSource.h"
 #import "RMAbstractWebMapSource.h"
 #import "RMAnnotation.h"
@@ -44,6 +43,7 @@
 #import "RMGenericMapSource.h"
 #import "RMGlobalConstants.h"
 #import "RMInteractiveSource.h"
+#import "RMLoadingTileView.h"
 #import "RMMBTilesSource.h"
 #import "RMMapBoxSource.h"
 #import "RMMapLayer.h"

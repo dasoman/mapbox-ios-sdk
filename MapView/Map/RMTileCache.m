@@ -25,7 +25,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-#include <sys/sysctl.h>
+#import <sys/utsname.h>
 
 #import "RMTileCache.h"
 #import "RMMemoryCache.h"
@@ -128,6 +128,16 @@
     });
 }
 
+- (void)insertCache:(id <RMTileCache>)cache atIndex:(NSUInteger)index
+{
+    dispatch_barrier_async(_tileCacheQueue, ^{
+        if (index >= [_tileCaches count])
+            [_tileCaches addObject:cache];
+        else
+            [_tileCaches insertObject:cache atIndex:index];
+    });
+}
+
 + (NSNumber *)tileHash:(RMTile)tile
 {
 	return [NSNumber numberWithUnsignedLongLong:RMTileKey(tile)];
@@ -213,51 +223,46 @@
 
 @implementation RMTileCache (Configuration)
 
-+ (NSString *)sysctlbyname:(NSString *)name
-{
-	size_t len;
-    sysctlbyname([name UTF8String], NULL, &len, NULL, 0);
-
-    char *sysctlResult = malloc(len);
-	sysctlbyname([name UTF8String], sysctlResult, &len, NULL, 0);
-
-	NSString *result = [NSString stringWithCString:sysctlResult encoding:NSASCIIStringEncoding];
-	free(sysctlResult);
-
-	return result;
-}
+static NSMutableDictionary *predicateValues = nil;
 
 - (NSDictionary *)predicateValues
 {
-    NSString *machine = [RMTileCache sysctlbyname:@"hw.machine"];
+    static dispatch_once_t predicateValuesOnceToken;
 
-    NSMutableDictionary *predicateValues = [NSMutableDictionary dictionaryWithObjectsAndKeys:
-                                            [[UIDevice currentDevice] model], @"model",
-                                            machine, @"machine",
-                                            [[UIDevice currentDevice] systemName], @"systemName",
-                                            [NSNumber numberWithFloat:[[[UIDevice currentDevice] systemVersion] floatValue]], @"systemVersion",
-                                            [NSNumber numberWithInt:[[UIDevice currentDevice] userInterfaceIdiom]], @"userInterfaceIdiom",
-                                            nil];
+    dispatch_once(&predicateValuesOnceToken, ^{
+        struct utsname systemInfo;
+        uname(&systemInfo);
 
-    if ( ! ([machine isEqualToString:@"i386"] || [machine isEqualToString:@"x86_64"]))
-    {
-        NSNumber *machineNumber = [NSNumber numberWithFloat:[[[machine stringByTrimmingCharactersInSet:[NSCharacterSet letterCharacterSet]] stringByReplacingOccurrencesOfString:@"," withString:@"."] floatValue]];
+        NSString *machine = [NSString stringWithCString:systemInfo.machine encoding:NSASCIIStringEncoding];
 
-        if ( ! machineNumber)
-            machineNumber = [NSNumber numberWithFloat:0.0];
+        predicateValues = [[NSMutableDictionary alloc] initWithObjectsAndKeys:
+                           [[UIDevice currentDevice] model], @"model",
+                           machine, @"machine",
+                           [[UIDevice currentDevice] systemName], @"systemName",
+                           [NSNumber numberWithFloat:[[[UIDevice currentDevice] systemVersion] floatValue]], @"systemVersion",
+                           [NSNumber numberWithInt:[[UIDevice currentDevice] userInterfaceIdiom]], @"userInterfaceIdiom",
+                           nil];
 
-        [predicateValues setObject:machineNumber forKey:@"machineNumber"];
-    }
-    else
-    {
-        [predicateValues setObject:[NSNumber numberWithFloat:0.0] forKey:@"machineNumber"];
-    }
+        if ( ! ([machine isEqualToString:@"i386"] || [machine isEqualToString:@"x86_64"]))
+        {
+            NSNumber *machineNumber = [NSNumber numberWithFloat:[[[machine stringByTrimmingCharactersInSet:[NSCharacterSet letterCharacterSet]] stringByReplacingOccurrencesOfString:@"," withString:@"."] floatValue]];
 
-    // A predicate might be:
-    // (self.model = 'iPad' and self.machineNumber >= 3) or (self.machine = 'x86_64')
-    // See NSPredicate
+            if ( ! machineNumber)
+                machineNumber = [NSNumber numberWithFloat:0.0];
 
-//    NSLog(@"Predicate values:\n%@", [predicateValues description]);
+            [predicateValues setObject:machineNumber forKey:@"machineNumber"];
+        }
+        else
+        {
+            [predicateValues setObject:[NSNumber numberWithFloat:0.0] forKey:@"machineNumber"];
+        }
+
+        // A predicate might be:
+        // (self.model = 'iPad' and self.machineNumber >= 3) or (self.machine = 'x86_64')
+        // See NSPredicate
+
+//        NSLog(@"Predicate values:\n%@", [predicateValues description]);
+    });
 
     return predicateValues;
 }
